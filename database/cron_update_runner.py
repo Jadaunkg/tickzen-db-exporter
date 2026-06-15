@@ -390,6 +390,11 @@ def run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index,
                 aborted_due_to_errors = True
                 break
 
+            # Sleep 30 seconds between tickers to avoid rate limiting and spamming Yahoo Finance
+            if idx < len(chunk):
+                logger.info(f"Sleeping for 30 seconds before processing next ticker...")
+                time.sleep(30)
+
         total_processed += len(chunk)
         total_success += chunk_success
         total_fail += chunk_fail
