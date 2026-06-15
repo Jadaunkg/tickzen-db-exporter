@@ -929,8 +929,9 @@ class PipelineDataCollector:
                     logger.info("  ⚡ Finished peer comparison fetch.")
                     return peers
 
-                # Submit to ThreadPoolExecutor
-                from concurrent.futures import ThreadPoolExecutor, as_completed
+                # Submit to ThreadPoolExecutor or run sequentially if on Render / to avoid rate limiting
+                run_sequentially = os.environ.get('RENDER') == 'true' or os.getenv('RUN_SEQUENTIAL', 'true').lower() == 'true'
+                
                 tasks = {
                     'info': fetch_info,
                     'news': fetch_news,
@@ -944,15 +945,28 @@ class PipelineDataCollector:
                 }
 
                 fetched_data = {}
-                with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-                    future_to_key = {executor.submit(func): key for key, func in tasks.items()}
-                    for future in as_completed(future_to_key):
-                        key = future_to_key[future]
+                if run_sequentially:
+                    logger.info("  ℹ️ Running fundamental fetches sequentially to avoid rate limiting...")
+                    for key, func in tasks.items():
                         try:
-                            fetched_data[key] = future.result()
+                            # small delay between fetches to be safe
+                            time.sleep(0.5)
+                            fetched_data[key] = func()
                         except Exception as exc:
-                            logger.warning(f"  ⚠️  Parallel fetch for '{key}' generated an exception: {exc}")
+                            logger.warning(f"  ⚠️  Sequential fetch for '{key}' generated an exception: {exc}")
                             fetched_data[key] = None
+                else:
+                    # Submit to ThreadPoolExecutor
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                        future_to_key = {executor.submit(func): key for key, func in tasks.items()}
+                        for future in as_completed(future_to_key):
+                            key = future_to_key[future]
+                            try:
+                                fetched_data[key] = future.result()
+                            except Exception as exc:
+                                logger.warning(f"  ⚠️  Parallel fetch for '{key}' generated an exception: {exc}")
+                                fetched_data[key] = None
 
                 # Process results: info (handle cache & fresh dividends)
                 if profile_cached:

@@ -151,6 +151,13 @@ def prepare_bulk_prices(tickers: List[str]):
         logger.info(f"Successfully cached bulk price data for {len(prices_dict)} tickers")
     except Exception as e:
         logger.warning(f"Failed to bulk download prices: {e}. Falling back to individual stock downloads.")
+        msg = str(e)
+        if any(k in msg for k in ['Too Many Requests', 'Rate limited', '429', '401', 'Unauthorized', 'crumb', 'Crumb']):
+            try:
+                from data_processing_scripts.data_collection import _register_rate_limit
+                _register_rate_limit(msg)
+            except Exception:
+                pass
 
 
 def export_multiple_stocks(exporter: AzurePostgresDataExporter, tickers: List[str]) -> Dict:

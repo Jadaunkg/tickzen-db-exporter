@@ -767,6 +767,14 @@ def fetch_stock_data(
                 info = yf_ticker.info
 
                 if not info or not info.get('symbol') or info.get('regularMarketPrice') is None:
+                    # Distinguish between delisted/invalid stock and a rate limit block by attempting a history fetch
+                    try:
+                        # If rate limited, this will raise an exception (YFRateLimitError or HTTPError)
+                        yf_ticker.history(period="1d", raise_errors=True)
+                    except Exception as hist_err:
+                        # Raise to be caught by the outer attempt loop exception handler (which registers rate limit)
+                        raise hist_err
+
                     logger.error(
                         f"Ticker {ticker} appears invalid/unavailable (missing symbol/regularMarketPrice in info)."
                     )
@@ -837,7 +845,7 @@ def fetch_stock_data(
 
             except Exception as e:
                 msg = str(e)
-                is_rate_limited = ('Too Many Requests' in msg) or ('Rate limited' in msg)
+                is_rate_limited = any(k in msg.lower() for k in ['too many requests', 'rate limited', '429', '401', 'unauthorized', 'crumb'])
                 if is_rate_limited:
                     cooldown, strikes = _register_rate_limit(msg)
                     logger.error(
@@ -999,8 +1007,13 @@ def get_current_market_price(ticker, timeout=10):
         
     except Exception as e:
         logger.error(f"Error getting current price for {ticker}: {e}")
-        if 'Too Many Requests' in str(e) or 'Rate limited' in str(e):
-            _set_last_fetch_error(ticker, 'rate_limited', str(e))
+        msg = str(e)
+        if any(k in msg.lower() for k in ['too many requests', 'rate limited', '429', '401', 'unauthorized', 'crumb']):
+            _set_last_fetch_error(ticker, 'rate_limited', msg)
+            try:
+                _register_rate_limit(msg)
+            except Exception:
+                pass
         return None
 
 def fetch_real_time_data(ticker, app_root, include_price=True, include_intraday=True):

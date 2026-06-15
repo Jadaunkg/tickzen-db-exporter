@@ -179,6 +179,8 @@ def handle_ticker_sync_result(db, ticker, result):
             if current_failures > 0:
                 db.table('monitored_tickers').update({'consecutive_failures': 0}).eq('symbol', ticker_upper).execute()
                 logger.info(f"✓ Reset consecutive failures for {ticker_upper} to 0")
+        elif is_temporary:
+            logger.info(f"ℹ Ticker {ticker_upper} sync failed/partial due to temporary rate limits or provider cooldown. Preserving consecutive_failures={current_failures}.")
         else:
             # It's a hard data availability failure
             new_failures = current_failures + 1

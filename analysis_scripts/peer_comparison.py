@@ -1362,36 +1362,54 @@ def get_peer_comparison_data(ticker, db_client=None):
         # Prepare list of all tickers to fetch (target + peers)
         all_tickers = [ticker] + peers
         
-        # Use ThreadPoolExecutor for parallel API calls
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import time
+        # Fetch all metrics sequentially if on Render or RUN_SEQUENTIAL is true, otherwise in parallel
+        import os
+        run_sequentially = os.environ.get('RENDER') == 'true' or os.getenv('RUN_SEQUENTIAL', 'true').lower() == 'true'
         
         start_time = time.time()
-        logging.info(f"Starting parallel fetch for {ticker} and {len(peers)} peers: {peers}")
         
-        # Fetch all metrics in parallel (max 6 concurrent connections to avoid rate limits)
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            # Submit all tasks
-            future_to_ticker = {
-                executor.submit(get_peer_metrics, t): t 
-                for t in all_tickers
-            }
-            
-            # Collect results as they complete
-            for future in as_completed(future_to_ticker):
-                ticker_name = future_to_ticker[future]
+        if run_sequentially:
+            logging.info(f"Starting sequential fetch for {ticker} and {len(peers)} peers: {peers} to avoid rate limits")
+            for t in all_tickers:
                 try:
-                    metrics = future.result()
+                    time.sleep(0.5)
+                    metrics = get_peer_metrics(t)
                     if metrics:
-                        comparison_data[ticker_name.upper()] = metrics
-                        logging.info(f"✓ Completed metrics for {ticker_name}")
+                        comparison_data[t.upper()] = metrics
+                        logging.info(f"✓ Completed metrics for {t}")
                     else:
-                        logging.warning(f"✗ No metrics returned for {ticker_name}")
+                        logging.warning(f"✗ No metrics returned for {t}")
                 except Exception as e:
-                    logging.error(f"✗ Error fetching metrics for {ticker_name}: {e}")
+                    logging.error(f"✗ Error fetching metrics for {t}: {e}")
+        else:
+            # Use ThreadPoolExecutor for parallel API calls
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            logging.info(f"Starting parallel fetch for {ticker} and {len(peers)} peers: {peers}")
+            
+            # Fetch all metrics in parallel (max 6 concurrent connections to avoid rate limits)
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                # Submit all tasks
+                future_to_ticker = {
+                    executor.submit(get_peer_metrics, t): t 
+                    for t in all_tickers
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_ticker):
+                    ticker_name = future_to_ticker[future]
+                    try:
+                        metrics = future.result()
+                        if metrics:
+                            comparison_data[ticker_name.upper()] = metrics
+                            logging.info(f"✓ Completed metrics for {ticker_name}")
+                        else:
+                            logging.warning(f"✗ No metrics returned for {ticker_name}")
+                    except Exception as e:
+                        logging.error(f"✗ Error fetching metrics for {ticker_name}: {e}")
         
         elapsed_time = time.time() - start_time
-        logging.info(f"Peer comparison completed for {ticker} with {len(comparison_data)-1} peers in {elapsed_time:.2f}s (parallel): {list(comparison_data.keys())}")
+        mode_str = "sequential" if run_sequentially else "parallel"
+        logging.info(f"Peer comparison completed for {ticker} with {len(comparison_data)-1} peers in {elapsed_time:.2f}s ({mode_str}): {list(comparison_data.keys())}")
         
         return comparison_data
         
