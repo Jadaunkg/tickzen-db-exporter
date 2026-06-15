@@ -49,6 +49,46 @@ def check_internet(host="8.8.8.8", port=53, timeout=3) -> bool:
     except socket.error:
         return False
 
+def log_public_ip():
+    """Retrieve and log the current instance's public IP address for debugging multi-instance throttling."""
+    try:
+        import requests
+        ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+        logger.info(f"ℹ️ Current Instance Public IP: {ip} (Use this to verify if Render instances share an IP pool)")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not retrieve public IP address: {e}")
+
+def log_rate_limit_diagnostics():
+    """Log yfinance rate-limiting troubleshooting and architecture recommendations."""
+    guide = """
+================================================================================
+YFINANCE RATE-LIMITING DIAGNOSTICS & TROUBLESHOOTING GUIDE
+================================================================================
+Yahoo Finance has throttled this instance or detected session abnormalities.
+
+Things you can try immediately:
+1. Restart the affected service:
+   - Sometimes yfinance gets stuck with a bad/stale cookie crumb.
+   - Restarting the process destroys the session cache and forces a fresh crumb fetch.
+2. Upgrade yfinance:
+   - Run: pip install -U yfinance
+   - Yahoo Finance changes its internal APIs frequently; keeping it up-to-date is crucial.
+3. Verify if Render is using a shared IP pool:
+   - On all active Render instances, run:
+     import requests
+     print(requests.get("https://api.ipify.org").text)
+   - If they share the same IP (e.g., 34.55.100.20), Yahoo throttles the shared IP capacity.
+   - If they differ, the throttle is due to request volume/session-related issues per container.
+
+Production Recommendation:
+- Do not rely on Yahoo Finance as the sole production source fetched independently by workers.
+- Recommended Architecture:
+  Yahoo Finance API -> One dedicated single-threaded collector service -> Azure PostgreSQL DB -> All workers read from DB
+  (This avoids concurrent IP/session scraping spikes and uses database cache instead of direct scraping).
+================================================================================
+"""
+    logger.warning(guide)
+
 def get_exporter_and_client():
     """Dynamically load the appropriate database client and exporter."""
     from analysis_scripts.peer_comparison import get_db_client
@@ -324,6 +364,7 @@ def run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index,
             cooldown_remaining = _rate_limit_cooldown_remaining_seconds()
             if cooldown_remaining > 0:
                 logger.warning(f"Aborting sync cycle early: yfinance provider rate limit cooldown is active ({int(cooldown_remaining)}s remaining) to avoid continuous failure loop.")
+                log_rate_limit_diagnostics()
                 aborted_due_to_errors = True
                 break
 
@@ -389,6 +430,7 @@ def run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index,
 
             if consecutive_failures >= 3:
                 logger.warning("Aborting sync cycle early: Hit 3 consecutive failures. Yahoo Finance may be rate-limiting us or crumb is invalid.")
+                log_rate_limit_diagnostics()
                 aborted_due_to_errors = True
                 break
 
@@ -445,6 +487,7 @@ def main():
         logger.warning("❌ No active internet connection detected. Skipping execution.")
         sys.exit(0)
     logger.info("✓ Internet connection verified.")
+    log_public_ip()
 
     # 2. Exporter and DB Setup
     exporter, db, db_type = get_exporter_and_client()
