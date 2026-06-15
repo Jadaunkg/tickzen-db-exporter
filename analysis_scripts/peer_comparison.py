@@ -178,7 +178,9 @@ def analyze_insider_availability(ticker):
         import yfinance as yf
         
         stock = _yf_ticker(ticker)
-        info = stock.info
+        info = stock.info if stock is not None else None
+        if info is None:
+            info = {}
         
         reasons = []
         
@@ -1093,7 +1095,9 @@ def is_etf(ticker, info=None):
     try:
         if info is None:
             stock = _yf_ticker(ticker)
-            info = stock.info
+            info = stock.info if stock is not None else None
+        if info is None:
+            info = {}
         
         # Common ETF indicators
         etf_indicators = [
@@ -1123,7 +1127,11 @@ def get_peer_metrics(ticker):
             logging.info(f"Fetching metrics for {ticker} (attempt {attempt + 1}/{max_retries})")
             
             stock = _yf_ticker(ticker)
+            if stock is None:
+                raise ValueError("Yahoo Finance ticker object is None")
             info = stock.info
+            if info is None or not isinstance(info, dict) or not info:
+                raise ValueError("Yahoo Finance info is None, empty, or not a dict (rate limited or invalid crumb)")
             
             # Check if this is an ETF
             etf_flag = is_etf(ticker, info=info)

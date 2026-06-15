@@ -264,7 +264,10 @@ class RiskAnalyzer:
             if info is None:
                 from data_processing_scripts.data_collection import _yf_ticker
                 stock = _yf_ticker(ticker)
-                info = stock.info
+                info = stock.info if stock is not None else None
+            
+            if info is None:
+                info = {}
             
             # Get historical data (90 days for volume analysis)
             if processed_data is not None and not processed_data.empty:
@@ -289,7 +292,6 @@ class RiskAnalyzer:
             volume_score = min(100, (avg_volume / 10_000_000) * 100) * 0.6
             
             # Component 2: Market Capitalization (15% weight)
-            info = stock.info
             market_cap = info.get('marketCap', 0)
             
             if market_cap == 0:
@@ -401,7 +403,10 @@ class RiskAnalyzer:
             if info is None:
                 from data_processing_scripts.data_collection import _yf_ticker
                 stock = _yf_ticker(ticker)
-                info = stock.info
+                info = stock.info if stock is not None else None
+            
+            if info is None:
+                info = {}
 
             def _clean_numeric(value):
                 if value is None or pd.isna(value):
@@ -421,8 +426,8 @@ class RiskAnalyzer:
                 if stock is None:
                     from data_processing_scripts.data_collection import _yf_ticker
                     stock = _yf_ticker(ticker)
-                annual_bs = stock.balance_sheet
-                annual_is = stock.financials
+                annual_bs = stock.balance_sheet if stock is not None else None
+                annual_is = stock.financials if stock is not None else None
 
             if annual_bs is not None and not annual_bs.empty and annual_is is not None and not annual_is.empty:
                 candidates.append((annual_bs.iloc[:, 0].to_dict(), annual_is.iloc[:, 0].to_dict(), annual_bs.columns[0], 'annual'))
@@ -431,8 +436,8 @@ class RiskAnalyzer:
                 if stock is None:
                     from data_processing_scripts.data_collection import _yf_ticker
                     stock = _yf_ticker(ticker)
-                quarterly_bs = stock.quarterly_balance_sheet
-                quarterly_is = stock.quarterly_financials
+                quarterly_bs = stock.quarterly_balance_sheet if stock is not None else None
+                quarterly_is = stock.quarterly_financials if stock is not None else None
                 if quarterly_bs is not None and not quarterly_bs.empty and quarterly_is is not None and not quarterly_is.empty:
                     candidates.append((quarterly_bs.iloc[:, 0].to_dict(), quarterly_is.iloc[:, 0].to_dict(), quarterly_bs.columns[0], 'quarterly'))
             except Exception:
@@ -483,7 +488,7 @@ class RiskAnalyzer:
             market_cap = _clean_numeric(info.get('marketCap'))
             market_cap_source = 'current_market_cap'
             shares_outstanding = _clean_numeric(info.get('sharesOutstanding'))
-            if shares_outstanding and period_end_date is not None:
+            if shares_outstanding and period_end_date is not None and stock is not None:
                 try:
                     pe = pd.Timestamp(period_end_date)
                     hist = stock.history(
@@ -882,20 +887,28 @@ class RiskAnalyzer:
         # ========================================================================
         if ticker:
             try:
-                altman_result = self.calculate_altman_z_score_robust(ticker)
+                altman_result = self.calculate_altman_z_score_robust(
+                    ticker,
+                    info=info,
+                    balance_sheet=balance_sheet,
+                    financials=financials
+                )
                 
                 if altman_result and 'z_score' in altman_result:
                     # Calculate data age
                     period_end = altman_result.get('period_end_date')
                     
-                    # Convert period_end to date if it's a timestamp (int)
-                    if period_end and isinstance(period_end, (int, float)):
-                        period_end = datetime.fromtimestamp(period_end).date()
-                    elif period_end and not isinstance(period_end, datetime):
-                        # Try to parse if it's a string or other type
+                    # Convert period_end to date
+                    if period_end:
                         try:
-                            period_end = datetime.fromisoformat(str(period_end)).date() if period_end else None
-                        except:
+                            if hasattr(period_end, 'date'):
+                                period_end = period_end.date()
+                            elif isinstance(period_end, (int, float)):
+                                period_end = datetime.fromtimestamp(period_end).date()
+                            else:
+                                period_end = pd.Timestamp(period_end).date()
+                        except Exception as parse_err:
+                            logging.warning(f"Could not parse period_end {period_end}: {parse_err}")
                             period_end = None
                     
                     if period_end:

@@ -260,25 +260,56 @@ def run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index,
         chunk_success = 0
         chunk_fail = 0
         chunk_partial = 0
+        consecutive_failures = 0
+        aborted_due_to_errors = False
 
         for idx, ticker in enumerate(chunk, 1):
+            # Check if yfinance rate limit cooldown is active
+            from data_processing_scripts.data_collection import _rate_limit_cooldown_remaining_seconds
+            cooldown_remaining = _rate_limit_cooldown_remaining_seconds()
+            if cooldown_remaining > 0:
+                logger.warning(f"Aborting sync cycle early: yfinance provider rate limit cooldown is active ({int(cooldown_remaining)}s remaining) to avoid continuous failure loop.")
+                aborted_due_to_errors = True
+                break
+
             logger.info(f"[{chunk_idx}/{len(chunks)}][{idx}/{len(chunk)}] Processing {ticker}...")
             try:
                 result = exporter.export_stock_data(ticker)
                 status = result.get('status', 'failed')
                 if status == 'success':
                     chunk_success += 1
+                    consecutive_failures = 0
                 elif status == 'partial':
                     chunk_partial += 1
+                    # Check if the partial success has rate-limiting related errors
+                    has_rate_limit_error = any(
+                        'rate_limited' in str(e).lower() or 
+                        'too many requests' in str(e).lower() or 
+                        'rate limit' in str(e).lower() or
+                        'invalid crumb' in str(e).lower() or
+                        'unauthorized' in str(e).lower()
+                        for e in result.get('errors', [])
+                    )
+                    if has_rate_limit_error:
+                        consecutive_failures += 1
+                    else:
+                        consecutive_failures = 0
                 else:
                     chunk_fail += 1
+                    consecutive_failures += 1
                     logger.error(f"Failed to export {ticker}: {result.get('errors')}")
             except Exception as e:
                 chunk_fail += 1
+                consecutive_failures += 1
                 logger.error(f"Exception during export of {ticker}: {e}", exc_info=True)
             
             # Regenerate live HTML status dashboard after each ticker update
             update_dashboard()
+
+            if consecutive_failures >= 3:
+                logger.warning("Aborting sync cycle early: Hit 3 consecutive failures. Yahoo Finance may be rate-limiting us or crumb is invalid.")
+                aborted_due_to_errors = True
+                break
 
         total_processed += len(chunk)
         total_success += chunk_success
@@ -287,13 +318,17 @@ def run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index,
 
         logger.info(f"Finished Sub-batch {chunk_idx}/{len(chunks)}. Success: {chunk_success}, Failed: {chunk_fail}")
 
+        if aborted_due_to_errors:
+            logger.warning("Stopping entire batch sync because abort flag was raised.")
+            break
+
         if chunk_idx < len(chunks):
             logger.info(f"Sleeping for {sleep_interval_seconds / 60:.1f} minutes to bypass rate limits...")
             time.sleep(sleep_interval_seconds)
 
     duration = (datetime.now() - start_time).total_seconds()
     logger.info(f"Batch completed in {duration/60:.1f} minutes. Success: {total_success}, Failed: {total_fail}")
-    return total_fail == 0
+    return total_fail == 0 and not aborted_due_to_errors
 
 def main():
     import argparse

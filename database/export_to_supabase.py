@@ -1142,13 +1142,15 @@ class SupabaseDataExporter:
             logger.info("-" * 40)
             
             # Use UPDATE instead of UPSERT to only touch timestamp fields and avoid NULL violations
-            self.db.client.table('stocks').update(
-                {
-                    'updated_at': datetime.now().isoformat(),
-                    'last_sync_date': datetime.now().isoformat(),
-                    'last_sync_status': result['status']  # success, partial, or failed
-                }
-            ).eq('id', stock_id).execute()
+            update_data = {
+                'updated_at': datetime.now().isoformat(),
+                'last_sync_status': result['status']  # success, partial, or failed
+            }
+            # Only update last_sync_date if the sync succeeded or had partial data (i.e. not completely failed)
+            if result['status'] in ('success', 'partial'):
+                update_data['last_sync_date'] = datetime.now().isoformat()
+
+            self.db.client.table('stocks').update(update_data).eq('id', stock_id).execute()
             
             logger.info(f"  ✓ Final sync timestamps updated for stock ID {stock_id}")
             
