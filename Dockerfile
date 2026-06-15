@@ -46,9 +46,8 @@ RUN mkdir -p generated_data/forecast_cache \
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 
-# Expose port (Optional: in case Render requires a port binding for Web Services,
-# though Cron/Background Workers are preferred for this type of pipeline)
-EXPOSE 8080
+# Expose port (required by Render Web Services to pass port scanning checks)
+EXPOSE 10000
 
 # Default command: Runs the cron batch update runner
 CMD ["python", "database/cron_update_runner.py"]

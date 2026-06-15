@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Automated Cron Update Runner
-============================
+Automated Cron Update Runner & Web Service
+============================================
 
-Automated daily batch runner designed for macOS cron/launchd loops.
+Daemon batch runner designed for Render free-tier Web Services.
 Features:
-1. Internet connection check before starting.
-2. DB query to find which tickers from `stock_tickers_list.json` are pending.
-3. Priority sorting: new stocks (not in DB) processed first, then oldest/unsynced stocks.
-4. Auto-chunking: takes the first 70 stocks and updates them.
-5. Runs either Azure Postgres or Supabase exporter based on configuration.
+1. Starts a lightweight background HTTP server binding to PORT (default 10000) to pass Render's port scan.
+2. Serves a live, real-time status dashboard ('dashboard.html') updated after each stock sync.
+3. Automatically runs in a persistent loop, sleeping during active market hours to avoid rate conflicts.
 """
 
 import os
@@ -17,7 +15,9 @@ import sys
 import json
 import logging
 import socket
-from datetime import datetime, date
+import threading
+import time
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 
 # Add parent directory to path
@@ -83,7 +83,6 @@ def load_tickers_list() -> list:
         with open(json_path, "r") as f:
             data = json.load(f)
             tickers = data.get("tickers", [])
-            # Deduplicate while preserving order
             seen = set()
             deduped = [x.upper() for x in tickers if not (x.upper() in seen or seen.add(x.upper()))]
             return deduped
@@ -104,6 +103,198 @@ def load_tickers_from_db(db) -> list:
         logger.warning(f"Could not load tickers from database 'monitored_tickers' table (using fallback): {e}")
         return []
 
+def update_dashboard():
+    """Trigger dashboard HTML regeneration."""
+    try:
+        from database.generate_dashboard import main as run_dashboard_gen
+        run_dashboard_gen()
+        logger.info("Dashboard HTML page updated successfully.")
+    except Exception as e:
+        logger.warning(f"Failed to regenerate dashboard HTML: {e}")
+
+def start_dashboard_web_server():
+    """Start a background HTTP server serving dashboard.html to pass Render's port checks."""
+    import http.server
+    import socketserver
+    
+    port = int(os.getenv("PORT", 10000))
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
+    class DashboardHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/' or self.path == '/index.html':
+                dashboard_path = os.path.join(project_root, 'dashboard.html')
+                if os.path.exists(dashboard_path):
+                    self.send_response(200)
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    with open(dashboard_path, 'rb') as f:
+                        self.wfile.write(f.read())
+                    return
+            return super().do_GET()
+            
+        def log_message(self, format, *args):
+            # Suppress HTTP access logging to keep application logs clean
+            pass
+
+    socketserver.TCPServer.allow_reuse_address = True
+    try:
+        server = socketserver.TCPServer(('0.0.0.0', port), DashboardHandler)
+        logger.info(f"✓ Dashboard Web Server started successfully on port {port}")
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        return server
+    except Exception as e:
+        logger.error(f"❌ Failed to start dashboard web server on port {port}: {e}")
+        return None
+
+def run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index, total_instances, sub_batch_size, sleep_interval_seconds, preview_mode):
+    """Executes a single cycle of checking and updating tickers in sub-batches."""
+    logger.info("Beginning database sync cycle...")
+
+    # Load Tickers
+    all_tickers = load_tickers_from_db(db)
+    fallback_used = False
+    if not all_tickers:
+        logger.warning("No active tickers found in database monitored_tickers. Falling back to JSON.")
+        all_tickers = load_tickers_list()
+        fallback_used = True
+
+    if not all_tickers:
+        logger.error("No stock tickers found. Sync cycle aborted.")
+        return False
+
+    # Apply Alphabetical Workload Slicing
+    if instance_index is not None:
+        chunk_size = (len(all_tickers) + total_instances - 1) // total_instances
+        start_idx = instance_index * chunk_size
+        end_idx = min(start_idx + chunk_size, len(all_tickers))
+        sliced_tickers = all_tickers[start_idx:end_idx]
+        logger.info(f"Instance Partition active: {instance_index}/{total_instances} (Slice range index {start_idx} to {end_idx}).")
+        logger.info(f"Assigned workload: {len(sliced_tickers)} stocks.")
+        run_limit = limit_val if limit_val is not None else len(sliced_tickers)
+    else:
+        offset_val = max(0, offset_val)
+        sliced_tickers = all_tickers[offset_val:]
+        logger.info(f"Direct slicing active: Offset {offset_val}.")
+        logger.info(f"Assigned workload: {len(sliced_tickers)} stocks.")
+        run_limit = limit_val if limit_val is not None else 70
+
+    # Query DB to check today's sync statuses
+    try:
+        db_stocks = db.table('stocks').select('symbol', 'last_sync_date').execute()
+        db_map = {}
+        for s in db_stocks.data:
+            symbol = s['symbol'].upper()
+            last_sync = s.get('last_sync_date')
+            db_map[symbol] = last_sync
+    except Exception as e:
+        logger.error(f"Failed to fetch stock sync dates from database: {e}")
+        return False
+
+    # Filter and Prioritize Queue
+    today_str = date.today().isoformat()
+    new_stocks = []
+    pending_stocks = []
+    synced_count = 0
+
+    for ticker in sliced_tickers:
+        ticker_upper = ticker.upper()
+        if ticker_upper not in db_map:
+            new_stocks.append(ticker_upper)
+        else:
+            last_sync = db_map[ticker_upper]
+            if last_sync:
+                if hasattr(last_sync, 'strftime'):
+                    last_sync_date_str = last_sync.strftime('%Y-%m-%d')
+                else:
+                    last_sync_date_str = str(last_sync)
+
+                if last_sync_date_str.startswith(today_str):
+                    synced_count += 1
+                else:
+                    pending_stocks.append((ticker_upper, last_sync_date_str))
+            else:
+                pending_stocks.append((ticker_upper, ""))
+
+    pending_stocks.sort(key=lambda x: x[1] or "")
+    pending_tickers = [x[0] for x in pending_stocks]
+    queue = new_stocks + pending_tickers
+
+    logger.info(f"Queue Status: Synced Today: {synced_count}, New: {len(new_stocks)}, Outdated: {len(pending_tickers)}, Total Pending: {len(queue)}")
+
+    if not queue:
+        logger.info("✓ All assigned stocks are already synced and up-to-date today.")
+        return True
+
+    # Sub-Batch Split
+    target_tickers = queue[:run_limit]
+    chunks = [target_tickers[i:i + sub_batch_size] for i in range(0, len(target_tickers), sub_batch_size)]
+    
+    logger.info(f"Syncing {len(target_tickers)} stocks in {len(chunks)} sub-batches of size {sub_batch_size} (sleep {sleep_interval_seconds}s).")
+    
+    if preview_mode:
+        for chunk_idx, chunk in enumerate(chunks, 1):
+            logger.info(f"Preview [Sub-batch {chunk_idx}/{len(chunks)}]: {', '.join(chunk)}")
+        return True
+
+    # Sync Loop
+    start_time = datetime.now()
+    total_processed = 0
+    total_success = 0
+    total_fail = 0
+    total_partial = 0
+
+    for chunk_idx, chunk in enumerate(chunks, 1):
+        logger.info(f"\n================================================================================")
+        logger.info(f"STARTING SUB-BATCH {chunk_idx}/{len(chunks)} ({len(chunk)} tickers)")
+        logger.info(f"================================================================================\n")
+        
+        if db_type == "azure":
+            try:
+                from database.export_to_azure_postgres import prepare_bulk_prices
+                prepare_bulk_prices(chunk)
+            except Exception as e:
+                logger.warning(f"Failed to prepare bulk prices: {e}")
+
+        chunk_success = 0
+        chunk_fail = 0
+        chunk_partial = 0
+
+        for idx, ticker in enumerate(chunk, 1):
+            logger.info(f"[{chunk_idx}/{len(chunks)}][{idx}/{len(chunk)}] Processing {ticker}...")
+            try:
+                result = exporter.export_stock_data(ticker)
+                status = result.get('status', 'failed')
+                if status == 'success':
+                    chunk_success += 1
+                elif status == 'partial':
+                    chunk_partial += 1
+                else:
+                    chunk_fail += 1
+                    logger.error(f"Failed to export {ticker}: {result.get('errors')}")
+            except Exception as e:
+                chunk_fail += 1
+                logger.error(f"Exception during export of {ticker}: {e}", exc_info=True)
+            
+            # Regenerate live HTML status dashboard after each ticker update
+            update_dashboard()
+
+        total_processed += len(chunk)
+        total_success += chunk_success
+        total_fail += chunk_fail
+        total_partial += chunk_partial
+
+        logger.info(f"Finished Sub-batch {chunk_idx}/{len(chunks)}. Success: {chunk_success}, Failed: {chunk_fail}")
+
+        if chunk_idx < len(chunks):
+            logger.info(f"Sleeping for {sleep_interval_seconds / 60:.1f} minutes to bypass rate limits...")
+            time.sleep(sleep_interval_seconds)
+
+    duration = (datetime.now() - start_time).total_seconds()
+    logger.info(f"Batch completed in {duration/60:.1f} minutes. Success: {total_success}, Failed: {total_fail}")
+    return total_fail == 0
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Cron update runner for TickZen stock data.")
@@ -114,28 +305,20 @@ def main():
     parser.add_argument("--total-instances", type=int, help="Total number of parallel instances (overrides env TOTAL_INSTANCES).")
     parser.add_argument("--sub-batch-size", type=int, help="Number of stocks to process per sub-batch to avoid rate limits (overrides env SUB_BATCH_SIZE).")
     parser.add_argument("--batch-sleep", type=int, help="Seconds to sleep between sub-batches (overrides env BATCH_SLEEP_SECONDS).")
+    parser.add_argument("--once", action="store_true", help="Run once and exit instead of starting a persistent HTTP daemon.")
     parser.add_argument("--force", action="store_true", help="Force execution even outside allowed hours.")
     args = parser.parse_args()
 
-    # Time window check: Only run database export during off-market hours (07:00 to 18:30 IST)
-    # to prevent hitting yfinance rate limits concurrently with the active trading daemon.
-    if not args.force:
+    # Determine execution window check for single runs
+    if args.once and not args.force:
         now = datetime.now()
         current_hour = now.hour
         current_minute = now.minute
-        
-        is_allowed = False
-        if 7 <= current_hour < 18:
-            is_allowed = True
-        elif current_hour == 18 and current_minute <= 30:
-            is_allowed = True
-            
+        is_allowed = 7 <= current_hour < 18 or (current_hour == 18 and current_minute <= 30)
         if not is_allowed:
-            logger.info(f"Execution skipped: Current time ({now.strftime('%H:%M')}) is outside the allowed database export window (07:00 to 18:30 IST) to avoid yfinance rate limit conflicts with the active trading daemon. Use --force to override.")
+            logger.info(f"Outside allowed database export window (07:00 to 18:30 IST). Execution skipped. Use --force to override.")
             sys.exit(0)
 
-    logger.info("Starting automated data sync check...")
-    
     # 1. Connectivity Check
     if not check_internet():
         logger.warning("❌ No active internet connection detected. Skipping execution.")
@@ -165,175 +348,40 @@ def main():
     sub_batch_size = args.sub_batch_size if args.sub_batch_size is not None else (int(env_sub_batch_size) if env_sub_batch_size else 70)
     sleep_interval_seconds = args.batch_sleep if args.batch_sleep is not None else (int(env_batch_sleep) if env_batch_sleep else 4200)
 
-    # 3. Load Tickers
-    all_tickers = load_tickers_from_db(db)
-    fallback_used = False
-    if not all_tickers:
-        logger.warning("No active tickers found in 'monitored_tickers' table. Falling back to stock_tickers_list.json.")
-        all_tickers = load_tickers_list()
-        fallback_used = True
-
-    if not all_tickers:
-        logger.error("❌ No tickers found in database or stock_tickers_list.json. Exiting.")
-        sys.exit(1)
-
-    if fallback_used:
-        logger.info(f"Loaded {len(all_tickers)} total tickers from stock_tickers_list.json (fallback).")
-    else:
-        logger.info(f"Loaded {len(all_tickers)} active tickers from monitored_tickers table.")
-
-    # Apply Slicing
-    if instance_index is not None:
-        chunk_size = (len(all_tickers) + total_instances - 1) // total_instances
-        start_idx = instance_index * chunk_size
-        end_idx = min(start_idx + chunk_size, len(all_tickers))
-        sliced_tickers = all_tickers[start_idx:end_idx]
-        logger.info(f"Partitioning active: Instance {instance_index}/{total_instances} (Slice index {start_idx} to {end_idx}).")
-        logger.info(f"Sliced list to {len(sliced_tickers)} tickers for this instance.")
-        run_limit = limit_val if limit_val is not None else len(sliced_tickers)
-    else:
-        offset_val = max(0, offset_val)
-        sliced_tickers = all_tickers[offset_val:]
-        logger.info(f"Direct slicing active: Offset {offset_val}.")
-        logger.info(f"Sliced list has {len(sliced_tickers)} tickers.")
-        run_limit = limit_val if limit_val is not None else 70
-
-    # 4. Query DB for Last Sync Dates
-    try:
-        # Select symbol and last_sync_date
-        db_stocks = db.table('stocks').select('symbol', 'last_sync_date').execute()
-        db_map = {}
-        for s in db_stocks.data:
-            symbol = s['symbol'].upper()
-            last_sync = s.get('last_sync_date')
-            db_map[symbol] = last_sync
-    except Exception as e:
-        logger.error(f"❌ Failed to fetch stocks from database: {e}")
-        sys.exit(1)
-
-    # 5. Filter and Prioritize Queue
-    today_str = date.today().isoformat()
-    new_stocks = []
-    pending_stocks = []
-    synced_count = 0
-
-    for ticker in sliced_tickers:
-        ticker_upper = ticker.upper()
-        if ticker_upper not in db_map:
-            new_stocks.append(ticker_upper)
-        else:
-            last_sync = db_map[ticker_upper]
-            if last_sync:
-                # convert to string to check or handle object
-                if hasattr(last_sync, 'strftime'):
-                    last_sync_date_str = last_sync.strftime('%Y-%m-%d')
-                else:
-                    last_sync_date_str = str(last_sync)
-
-                if last_sync_date_str.startswith(today_str):
-                    synced_count += 1
-                else:
-                    pending_stocks.append((ticker_upper, last_sync_date_str))
-            else:
-                pending_stocks.append((ticker_upper, ""))
-
-    # Sort pending stocks: oldest last_sync first (nulls/empty first)
-    pending_stocks.sort(key=lambda x: x[1] or "")
-    pending_tickers = [x[0] for x in pending_stocks]
-
-    # Combine queue: New stocks first, then pending stocks
-    queue = new_stocks + pending_tickers
-
-    logger.info(f"Queue Status:")
-    logger.info(f"  - Already Synced Today: {synced_count}")
-    logger.info(f"  - New Tickers (Not in DB): {len(new_stocks)} ({', '.join(new_stocks[:10])}...)" if new_stocks else "  - New Tickers (Not in DB): 0")
-    logger.info(f"  - Outdated Tickers: {len(pending_tickers)}")
-    logger.info(f"  - Total Pending Queue: {len(queue)}")
-
-    if not queue:
-        logger.info("✓ All stocks are up to date for today. No execution needed.")
-        sys.exit(0)
-
-    # 6. Apply Batch Limit and Split into Sub-batches
-    target_tickers = queue[:run_limit]
+    if args.once:
+        # Run once and exit (e.g. for Cron run)
+        success = run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index, total_instances, sub_batch_size, sleep_interval_seconds, args.preview)
+        sys.exit(0 if success else 1)
     
-    # Split target_tickers into chunks of sub_batch_size
-    chunks = [target_tickers[i:i + sub_batch_size] for i in range(0, len(target_tickers), sub_batch_size)]
-    
-    logger.info(f"Target Queue of {len(target_tickers)} tickers split into {len(chunks)} sub-batches (size={sub_batch_size}, sleep={sleep_interval_seconds}s).")
-    
-    if args.preview:
-        for chunk_idx, chunk in enumerate(chunks, 1):
-            logger.info(f"Preview [Sub-batch {chunk_idx}/{len(chunks)}]: {', '.join(chunk)}")
-        logger.info("Preview mode active. Exiting without execution.")
-        sys.exit(0)
+    # Render Web Service (Daemon mode)
+    # Start web server
+    server = start_dashboard_web_server()
+    # Generate initial dashboard immediately
+    update_dashboard()
 
-    # 7. Execute Export in Sub-batches
-    start_time = datetime.now()
-    total_processed = 0
-    total_success = 0
-    total_fail = 0
-    total_partial = 0
-
-    for chunk_idx, chunk in enumerate(chunks, 1):
-        logger.info(f"\n================================================================================")
-        logger.info(f"STARTING SUB-BATCH {chunk_idx}/{len(chunks)} ({len(chunk)} tickers)")
-        logger.info(f"================================================================================\n")
+    logger.info("Entering persistent daemon scheduler loop...")
+    while True:
+        # Check time window (07:00 to 18:30 IST)
+        # Convert UTC to IST
+        utc_now = datetime.now(timezone.utc)
+        ist_now = utc_now + timedelta(hours=5, minutes=30)
         
-        # If Azure, run bulk download for prices first
-        if db_type == "azure":
-            try:
-                from database.export_to_azure_postgres import prepare_bulk_prices
-                prepare_bulk_prices(chunk)
-            except Exception as e:
-                logger.warning(f"Failed to prepare bulk prices: {e}")
-
-        chunk_success = 0
-        chunk_fail = 0
-        chunk_partial = 0
-
-        for idx, ticker in enumerate(chunk, 1):
-            logger.info(f"[{chunk_idx}/{len(chunks)}][{idx}/{len(chunk)}] Processing {ticker}...")
-            try:
-                result = exporter.export_stock_data(ticker)
-                status = result.get('status', 'failed')
-                if status == 'success':
-                    chunk_success += 1
-                elif status == 'partial':
-                    chunk_partial += 1
-                else:
-                    chunk_fail += 1
-                    logger.error(f"Failed to export {ticker}: {result.get('errors')}")
-            except Exception as e:
-                chunk_fail += 1
-                logger.error(f"Exception during export of {ticker}: {e}", exc_info=True)
-
-        total_processed += len(chunk)
-        total_success += chunk_success
-        total_fail += chunk_fail
-        total_partial += chunk_partial
-
-        logger.info(f"Finished Sub-batch {chunk_idx}/{len(chunks)}. Success: {chunk_success}, Partial: {chunk_partial}, Failed: {chunk_fail}")
-
-        # Sleep between sub-batches
-        if chunk_idx < len(chunks):
-            logger.info(f"Sleeping for {sleep_interval_seconds / 60:.1f} minutes before next sub-batch to prevent API rate limits...")
-            import time
-            time.sleep(sleep_interval_seconds)
-
-    duration = (datetime.now() - start_time).total_seconds()
-    
-    logger.info("\n" + "="*80)
-    logger.info("BATCH EXPORT RUN COMPLETE")
-    logger.info("="*80)
-    logger.info(f"Duration: {duration/60:.1f} minutes")
-    logger.info(f"Processed: {total_processed}")
-    logger.info(f"Success: {total_success}")
-    logger.info(f"Partial: {total_partial}")
-    logger.info(f"Failed: {total_fail}")
-    logger.info("="*80 + "\n")
-
-    sys.exit(0 if total_fail == 0 else 1)
+        current_hour = ist_now.hour
+        current_minute = ist_now.minute
+        
+        is_allowed = 7 <= current_hour < 18 or (current_hour == 18 and current_minute <= 30)
+        
+        if args.force:
+            is_allowed = True
+            
+        if is_allowed:
+            run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index, total_instances, sub_batch_size, sleep_interval_seconds, args.preview)
+            
+            logger.info("Sync cycle complete. Sleeping for 1 hour...")
+            time.sleep(3600)
+        else:
+            logger.info(f"Allowed IST window (07:00 to 18:30) is currently closed. Current IST: {ist_now.strftime('%H:%M')}. Re-checking in 15 minutes...")
+            time.sleep(900)
 
 if __name__ == "__main__":
     main()
