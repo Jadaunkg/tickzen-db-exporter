@@ -1,0 +1,35 @@
+# Standalone Database Exporter - Requirements
+
+# Core HTTP and API Communications
+requests>=2.32.3
+python-dotenv>=1.1.0
+
+# Data Processing and Scientific Computing
+pandas==2.2.3
+numpy>=2.2.5
+scipy>=1.15.3
+
+# Financial APIs and Indicators
+yfinance>=0.2.58
+finnhub-python>=2.4.20
+pandas-datareader>=0.10.0
+ta>=0.11.0
+
+# Forecasting Models
+prophet>=1.1.6
+
+# Date Utilities
+pytz>=2025.2
+python-dateutil>=2.9.0.post0
+
+# Database Clients
+supabase>=2.3.4
+psycopg2-binary>=2.9.9
+
+# Natural Language Processing (for sentiment analysis)
+vaderSentiment>=3.3.2
+textblob>=0.17.1
+
+# Web Server (Optional - for Render Web Service compatibility if needed)
+gunicorn>=21.2.0
+Flask>=3.1.0

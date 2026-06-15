@@ -1,0 +1,485 @@
+-- ============================================================================
+-- TICKZEN2 COMPLETE DATABASE SCHEMA
+-- ============================================================================
+-- Generated: 2026-05-27 10:37:02
+-- Database: Supabase PostgreSQL
+-- Purpose: Complete schema for database replication
+--
+-- Usage:
+--   1. Create new Supabase project
+--   2. Go to SQL Editor
+--   3. Run this entire script
+--   4. Database structure will be recreated
+-- ============================================================================
+
+-- TABLE SUMMARY
+-- ============================================================================
+-- altman_zscore_data            :  15 columns
+-- analyst_data                  :  10 columns
+-- daily_price_data              :  13 columns
+-- data_sync_log                 :  15 columns
+-- dividend_data                 :  16 columns
+-- forecast_data                 :   9 columns
+-- fundamental_data              :  44 columns
+-- insider_transactions          :  10 columns
+-- liquidity_risk_data           :  10 columns
+-- market_price_snapshot         :  27 columns
+-- ownership_data                :  12 columns
+-- peer_comparison_data          :  17 columns
+-- regime_risk_data              :  11 columns
+-- risk_data                     : 118 columns
+-- sentiment_data                :   9 columns
+-- stocks                        :  25 columns
+-- technical_indicators          :  29 columns
+-- ============================================================================
+
+-- DETAILED COLUMN LISTING
+-- ============================================================================
+
+-- ALTMAN_ZSCORE_DATA
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • date
+--   • z_score
+--   • risk_zone
+--   • bankruptcy_risk
+--   • data_quality
+--   • working_capital_ratio
+--   • retained_earnings_ratio
+--   • ebit_ratio
+--   • market_value_ratio
+--   • sales_ratio
+--   • components
+--   • created_at
+--   • updated_at
+
+-- ANALYST_DATA
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • target_price_mean
+--   • target_price_median
+--   • target_price_high
+--   • target_price_low
+--   • analyst_rating
+--   • analyst_count
+--   • next_earnings_date
+--   • updated_at
+
+-- DAILY_PRICE_DATA
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • date
+--   • open_price
+--   • high_price
+--   • low_price
+--   • close_price
+--   • adjusted_close
+--   • volume
+--   • daily_return_pct
+--   • price_change
+--   • created_at
+--   • updated_at
+
+-- DATA_SYNC_LOG
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • sync_type
+--   • sync_date
+--   • records_inserted
+--   • records_updated
+--   • records_deleted
+--   • records_failed
+--   • sync_status
+--   • error_message
+--   • sync_duration_seconds
+--   • data_quality_score
+--   • source_api
+--   • api_version
+--   • created_at
+
+-- DIVIDEND_DATA
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • dividend_rate
+--   • dividend_yield_pct
+--   • payout_ratio
+--   • avg_dividend_yield_5y
+--   • dividend_forward_rate
+--   • dividend_forward_yield
+--   • dividend_trailing_rate
+--   • dividend_trailing_yield
+--   • ex_dividend_date
+--   • payment_date
+--   • last_split_date
+--   • last_split_factor
+--   • created_at
+--   • updated_at
+
+-- FORECAST_DATA
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • forecast_date
+--   • forecast_price_1y
+--   • forecast_avg_price
+--   • forecast_range_width
+--   • forecast_period
+--   • created_at
+--   • updated_at
+
+-- FUNDAMENTAL_DATA
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • period_date
+--   • period_type
+--   • pe_ratio
+--   • pe_forward
+--   • price_to_sales
+--   • price_to_book
+--   • ev_to_revenue
+--   • ev_to_ebitda
+--   • price_to_fcf
+--   • net_margin
+--   • operating_margin
+--   • gross_margin
+--   • ebitda_margin
+--   • roe
+--   • roa
+--   • debt_to_equity
+--   • total_cash
+--   • total_debt
+--   • free_cash_flow
+--   • operating_cash_flow
+--   • current_ratio
+--   • quick_ratio
+--   • revenue_ttm
+--   • revenue_growth_yoy
+--   • net_income_ttm
+--   • earnings_growth_yoy
+--   • ebitda_ttm
+--   • gross_profit_ttm
+--   • created_at
+--   • updated_at
+--   • peg_ratio
+--   • roic
+--   • asset_turnover
+--   • inventory_turnover
+--   • receivables_turnover
+--   • working_capital_turnover
+--   • dso
+--   • dio
+--   • ccc
+--   • operating_income
+--   • eps_basic
+--   • eps_diluted
+
+-- INSIDER_TRANSACTIONS
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • insider_name
+--   • relation_to_company
+--   • transaction_date
+--   • shares_change
+--   • transaction_price
+--   • estimated_value
+--   • created_at
+--   • updated_at
+
+-- LIQUIDITY_RISK_DATA
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • date
+--   • liquidity_score
+--   • risk_level
+--   • trading_volume_consistency
+--   • market_depth_score
+--   • components
+--   • created_at
+--   • updated_at
+
+-- MARKET_PRICE_SNAPSHOT
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • date
+--   • current_price
+--   • price_change
+--   • change_pct
+--   • change_15d_pct
+--   • change_52w_pct
+--   • performance_1y_pct
+--   • overall_pct_change
+--   • high_52w
+--   • low_52w
+--   • market_cap
+--   • enterprise_value
+--   • shares_outstanding
+--   • float_shares
+--   • sp500_index
+--   • interest_rate
+--   • created_at
+--   • updated_at
+--   • from_52wk_high_pct
+--   • from_52wk_low_pct
+--   • pe_ratio
+--   • pb_ratio
+--   • day_trend
+--   • momentum_score
+--   • price_alert_flags
+
+-- OWNERSHIP_DATA
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • report_date
+--   • insider_ownership_pct
+--   • institutional_ownership_pct
+--   • shares_short
+--   • short_ratio_days
+--   • short_pct_float
+--   • shares_short_prev
+--   • shares_outstanding_diluted
+--   • created_at
+--   • updated_at
+
+-- PEER_COMPARISON_DATA
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • peer_ticker
+--   • peer_name
+--   • is_target
+--   • market_cap
+--   • pe_ratio
+--   • revenue_growth
+--   • net_margin
+--   • eps
+--   • roe
+--   • debt_to_equity
+--   • dividend_yield
+--   • week_52_high
+--   • week_52_low
+--   • created_at
+--   • updated_at
+
+-- REGIME_RISK_DATA
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • date
+--   • current_regime
+--   • regime_confidence
+--   • bull_volatility
+--   • bear_downside_capture
+--   • correction_volatility
+--   • regime_analysis
+--   • created_at
+--   • updated_at
+
+-- RISK_DATA
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • date
+--   • var_95
+--   • var_99
+--   • sharpe_ratio
+--   • sortino_ratio
+--   • calmar_ratio
+--   • max_drawdown
+--   • beta
+--   • market_correlation
+--   • skewness
+--   • kurtosis
+--   • created_at
+--   • updated_at
+--   • cvar_95
+--   • cvar_99
+--   • volatility_30d_annual
+--   • volatility_historical_annual
+--   • var_95_data_period_days
+--   • var_95_sample_size
+--   • var_95_calculation_method
+--   • var_95_confidence_level
+--   • var_95_return_frequency
+--   • var_99_data_period_days
+--   • var_99_sample_size
+--   • var_99_calculation_method
+--   • var_99_confidence_level
+--   • var_99_return_frequency
+--   • cvar_95_data_period_days
+--   • cvar_95_tail_size
+--   • cvar_95_calculation_method
+--   • cvar_95_confidence_level
+--   • cvar_99_data_period_days
+--   • cvar_99_tail_size
+--   • cvar_99_calculation_method
+--   • cvar_99_confidence_level
+--   • volatility_30d_sample_days
+--   • volatility_30d_calculation_method
+--   • volatility_30d_annualization_factor
+--   • volatility_30d_return_frequency
+--   • volatility_30d_model_type
+--   • volatility_30d_fallback_logic
+--   • volatility_historical_sample_days
+--   • volatility_historical_calculation_method
+--   • volatility_historical_annualization_factor
+--   • volatility_historical_return_frequency
+--   • volatility_historical_model_type
+--   • volatility_trading_days_annual
+--   • liquidity_calculation_method
+--   • liquidity_data_period_days
+--   • liquidity_actual_sample_days
+--   • liquidity_volume_weight
+--   • liquidity_volume_benchmark
+--   • liquidity_mcap_weight
+--   • liquidity_mcap_benchmark
+--   • liquidity_stability_weight
+--   • liquidity_stability_metric
+--   • liquidity_data_freshness
+--   • liquidity_minimum_required_days
+--   • liquidity_sufficient_data
+--   • altman_calculation_method
+--   • altman_financial_period
+--   • altman_financial_period_end_date
+--   • altman_financial_data_source
+--   • altman_data_age_days
+--   • altman_filing_type
+--   • altman_required_fields_count
+--   • altman_available_fields_count
+--   • altman_data_completeness_percent
+--   • altman_minimum_completeness_percent
+--   • altman_retained_earnings_imputed
+--   • altman_imputation_method
+--   • altman_next_update_expected
+--   • altman_coefficient_a
+--   • altman_coefficient_b
+--   • altman_coefficient_c
+--   • altman_coefficient_d
+--   • altman_coefficient_e
+--   • sharpe_ratio_calculation_method
+--   • sharpe_ratio_data_period_days
+--   • sharpe_ratio_risk_free_rate_used
+--   • sharpe_ratio_risk_free_rate_source
+--   • sharpe_ratio_annualization_factor
+--   • sharpe_ratio_daily_rf_rate
+--   • sortino_ratio_calculation_method
+--   • sortino_ratio_data_period_days
+--   • sortino_ratio_annualization_factor
+--   • sortino_ratio_downside_focus
+--   • max_drawdown_calculation_method
+--   • max_drawdown_data_period_days
+--   • max_drawdown_definition
+--   • beta_calculation_method
+--   • beta_data_period_days
+--   • beta_market_benchmark
+--   • beta_return_frequency
+--   • correlation_calculation_method
+--   • correlation_data_period_days
+--   • correlation_market_benchmark
+--   • skewness_calculation_method
+--   • skewness_data_period_days
+--   • skewness_interpretation
+--   • kurtosis_calculation_method
+--   • kurtosis_data_period_days
+--   • var_estimation_confidence
+--   • volatility_estimation_confidence
+--   • liquidity_estimation_confidence
+--   • altman_estimation_confidence
+--   • sharpe_estimation_confidence
+--   • overall_profile_confidence
+--   • has_data_gaps
+--   • missing_price_data
+--   • missing_financial_data
+--   • insufficient_liquidity_data
+--   • data_quality_score
+--   • metadata_calculation_timestamp
+--   • metadata_version
+--   • risk_profile_calculation_method
+
+-- SENTIMENT_DATA
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • date
+--   • sentiment_score
+--   • sentiment_label
+--   • sentiment_confidence
+--   • analyst_sentiment
+--   • created_at
+--   • updated_at
+
+-- STOCKS
+-- ----------------------------------------------------------------------------
+--   • id
+--   • symbol
+--   • ticker
+--   • company_name
+--   • sector
+--   • industry
+--   • country
+--   • exchange
+--   • website_url
+--   • employee_count
+--   • business_summary
+--   • long_business_summary
+--   • created_at
+--   • updated_at
+--   • last_sync_date
+--   • last_sync_status
+--   • data_quality_score
+--   • data_start_date
+--   • data_end_date
+--   • total_records
+--   • is_active
+--   • sync_enabled
+--   • headquarters
+--   • ceo_name
+--   • founded_year
+
+-- TECHNICAL_INDICATORS
+-- ----------------------------------------------------------------------------
+--   • id
+--   • stock_id
+--   • date
+--   • sma_7
+--   • sma_20
+--   • sma_50
+--   • sma_100
+--   • sma_200
+--   • ema_12
+--   • ema_26
+--   • rsi_14
+--   • macd_line
+--   • macd_signal
+--   • macd_histogram
+--   • stochastic_osc
+--   • bb_upper
+--   • bb_middle
+--   • bb_lower
+--   • atr_14
+--   • volatility_7d
+--   • volatility_30d_annual
+--   • volume_sma_20
+--   • obv
+--   • green_days_count
+--   • support_30d
+--   • resistance_30d
+--   • adx
+--   • created_at
+--   • updated_at
+
+-- ============================================================================
+
+-- ============================================================================
+-- NOTE: Base schema not found
+-- Please manually create tables or include supabase_schema.sql
+-- ============================================================================
