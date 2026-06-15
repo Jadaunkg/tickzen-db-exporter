@@ -148,9 +148,62 @@ def start_dashboard_web_server():
         logger.error(f"❌ Failed to start dashboard web server on port {port}: {e}")
         return None
 
+def handle_ticker_sync_result(db, ticker, result):
+    """
+    Update ticker's consecutive failure count in monitored_tickers.
+    If it hits 3 consecutive failures, delete the ticker.
+    """
+    ticker_upper = ticker.upper().strip()
+    status = result.get('status', 'failed')
+    errors = result.get('errors', [])
+    
+    # Check if this was a temporary rate limit or connection issue
+    is_temporary = any(
+        keyword in str(e).lower()
+        for e in errors
+        for keyword in ['rate_limited', 'too many requests', 'rate limit', 'invalid crumb', 'unauthorized', 'cooldown']
+    )
+    
+    # If the sync succeeded or was partial without rate limit errors, we reset failures to 0
+    is_success = (status in ('success', 'partial')) and not is_temporary
+    
+    try:
+        # 1. Fetch current consecutive_failures count
+        res = db.table('monitored_tickers').select('consecutive_failures').eq('symbol', ticker_upper).execute()
+        if not res.data:
+            return # Ticker not in monitored_tickers
+            
+        current_failures = res.data[0].get('consecutive_failures') or 0
+        
+        if is_success:
+            if current_failures > 0:
+                db.table('monitored_tickers').update({'consecutive_failures': 0}).eq('symbol', ticker_upper).execute()
+                logger.info(f"✓ Reset consecutive failures for {ticker_upper} to 0")
+        else:
+            # It's a hard data availability failure
+            new_failures = current_failures + 1
+            logger.warning(f"⚠ Ticker {ticker_upper} failed data sync (Hard failure {new_failures}/3)")
+            
+            if new_failures >= 3:
+                # Delete the ticker from monitored_tickers
+                db.table('monitored_tickers').delete().eq('symbol', ticker_upper).execute()
+                logger.error(f"❌ Ticker {ticker_upper} deleted from monitored_tickers after 3 consecutive hard failures (likely delisted or invalid).")
+            else:
+                db.table('monitored_tickers').update({'consecutive_failures': new_failures}).eq('symbol', ticker_upper).execute()
+                
+    except Exception as db_err:
+        logger.warning(f"Could not update monitored_tickers failure count for {ticker_upper}: {db_err}")
+
 def run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index, total_instances, sub_batch_size, sleep_interval_seconds, preview_mode):
     """Executes a single cycle of checking and updating tickers in sub-batches."""
     logger.info("Beginning database sync cycle...")
+
+    # Ensure monitored_tickers has consecutive_failures column (Azure Postgres fallback)
+    if db_type == "azure" and hasattr(db, 'execute_raw_sql'):
+        try:
+            db.execute_raw_sql("ALTER TABLE monitored_tickers ADD COLUMN IF NOT EXISTS consecutive_failures INT DEFAULT 0;")
+        except Exception as e:
+            logger.warning(f"Could not ensure consecutive_failures column exists: {e}")
 
     # Load Tickers
     all_tickers = load_tickers_from_db(db)
@@ -273,6 +326,7 @@ def run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index,
                 break
 
             logger.info(f"[{chunk_idx}/{len(chunks)}][{idx}/{len(chunk)}] Processing {ticker}...")
+            result = None
             try:
                 result = exporter.export_stock_data(ticker)
                 status = result.get('status', 'failed')
@@ -302,6 +356,11 @@ def run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index,
                 chunk_fail += 1
                 consecutive_failures += 1
                 logger.error(f"Exception during export of {ticker}: {e}", exc_info=True)
+                result = {'status': 'failed', 'errors': [str(e)]}
+            
+            # Handle failure count and pruning logic
+            if result:
+                handle_ticker_sync_result(db, ticker, result)
             
             # Regenerate live HTML status dashboard after each ticker update
             update_dashboard()
