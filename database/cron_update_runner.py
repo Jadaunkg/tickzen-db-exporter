@@ -350,11 +350,31 @@ def run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index,
                         consecutive_failures = 0
                 else:
                     chunk_fail += 1
-                    consecutive_failures += 1
+                    # Check if the failure was due to rate limits or crumb errors
+                    has_rate_limit_error = any(
+                        'rate_limited' in str(e).lower() or 
+                        'too many requests' in str(e).lower() or 
+                        'rate limit' in str(e).lower() or
+                        'invalid crumb' in str(e).lower() or
+                        'unauthorized' in str(e).lower()
+                        for e in result.get('errors', [])
+                    )
+                    if has_rate_limit_error:
+                        consecutive_failures += 1
+                    else:
+                        consecutive_failures = 0
                     logger.error(f"Failed to export {ticker}: {result.get('errors')}")
             except Exception as e:
                 chunk_fail += 1
-                consecutive_failures += 1
+                # Check if the exception indicates rate limits
+                has_rate_limit_error = any(
+                    k in str(e).lower() 
+                    for k in ['rate_limited', 'too many requests', 'rate limit', 'invalid crumb', 'unauthorized']
+                )
+                if has_rate_limit_error:
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
                 logger.error(f"Exception during export of {ticker}: {e}", exc_info=True)
                 result = {'status': 'failed', 'errors': [str(e)]}
             
