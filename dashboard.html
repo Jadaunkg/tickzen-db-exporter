@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TickZen Exporter Dashboard</title>
+    <style>
+        :root {
+            --bg-color: #f8f9fa;
+            --card-bg: #ffffff;
+            --text-color: #212529;
+            --text-muted: #6c757d;
+            --border-color: #dee2e6;
+            --primary: #0d6efd;
+            --success: #198754;
+            --warning: #ffc107;
+            --danger: #dc3545;
+            --pending: #6c757d;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+            line-height: 1.5;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 15px;
+            margin-bottom: 25px;
+        }
+        
+        h1, h2, h3 {
+            margin: 0;
+            font-weight: 600;
+        }
+        
+        .date {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+        }
+        
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .stat-val {
+            font-size: 2rem;
+            font-weight: bold;
+            margin: 10px 0 5px 0;
+        }
+        
+        .stat-label {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        /* Instance List */
+        .section-title {
+            margin-bottom: 15px;
+            padding-bottom: 5px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .instances-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+        
+        .instance-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-top: 4px solid var(--primary);
+            border-radius: 4px;
+            padding: 15px;
+        }
+        
+        .instance-card.active-0 { border-top-color: #0d6efd; }
+        .instance-card.active-1 { border-top-color: #6610f2; }
+        .instance-card.active-2 { border-top-color: #6f42c1; }
+        .instance-card.active-3 { border-top-color: #d63384; }
+        .instance-card.active-4 { border-top-color: #fd7e14; }
+        
+        .instance-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .instance-range {
+            font-size: 0.8rem;
+            background: #e9ecef;
+            padding: 2px 8px;
+            border-radius: 12px;
+            color: #495057;
+            font-weight: bold;
+        }
+        
+        .progress-container {
+            margin: 15px 0;
+        }
+        
+        .progress-bar-bg {
+            background: #e9ecef;
+            height: 12px;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        
+        .progress-bar-fill {
+            background: var(--success);
+            height: 100%;
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+        
+        .progress-text {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-top: 5px;
+        }
+        
+        .ticker-list-box {
+            margin-top: 15px;
+            background: #f8f9fa;
+            border: 1px solid var(--border-color);
+            padding: 8px;
+            font-family: monospace;
+            font-size: 0.75rem;
+            max-height: 80px;
+            overflow-y: auto;
+            border-radius: 3px;
+            word-break: break-all;
+        }
+        
+        /* Table styles */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 30px;
+        }
+        
+        th, td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        th {
+            background-color: #f1f3f5;
+            font-weight: bold;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            color: #495057;
+        }
+        
+        tr:last-child td {
+            border-bottom: none;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            border-radius: 3px;
+            text-transform: uppercase;
+        }
+        
+        .badge.success { background: #d1e7dd; color: #0f5132; }
+        .badge.failed { background: #f8d7da; color: #842029; }
+        .badge.pending { background: #e2e3e5; color: #41464b; }
+        
+        .error-msg {
+            color: var(--danger);
+            font-family: monospace;
+            font-size: 0.8rem;
+        }
+        
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            padding-top: 15px;
+            border-top: 1px solid var(--border-color);
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>TickZen Exporter Monitoring Dashboard</h1>
+                <div class="date">Live Status as of June 15, 2026</div>
+            </div>
+            <div style="font-weight: bold; color: var(--primary);">Option A: Database-Driven Sync</div>
+        </header>
+        
+        <!-- Summary Stats -->
+        <div class="stats-grid">
+            <div class="stat-card" style="border-left: 4px solid var(--primary)">
+                <div class="stat-label">Total Active Tickers</div>
+                <div class="stat-val" style="color: var(--primary)">246</div>
+            </div>
+            <div class="stat-card" style="border-left: 4px solid var(--success)">
+                <div class="stat-label">Synced Today</div>
+                <div class="stat-val" style="color: var(--success)">128</div>
+            </div>
+            <div class="stat-card" style="border-left: 4px solid var(--warning)">
+                <div class="stat-label">Pending Today</div>
+                <div class="stat-val" style="color: var(--warning)">118</div>
+            </div>
+            <div class="stat-card" style="border-left: 4px solid var(--danger)">
+                <div class="stat-label">Failures Today</div>
+                <div class="stat-val" style="color: var(--danger)">0</div>
+            </div>
+        </div>
+        
+        <!-- Instance Division Workload -->
+        <h2 class="section-title">5-Instance Workload Partitioning</h2>
+        <div class="instances-grid">
+        
+            <div class="instance-card active-0">
+                <div class="instance-header">
+                    <h3>Instance 0</h3>
+                    <span class="instance-range">AAL - CMI</span>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" style="width: 58.0%"></div>
+                    </div>
+                    <div class="progress-text">
+                        <span>Synced: <strong>29</strong> / 50</span>
+                        <span>58% Done</span>
+                    </div>
+                </div>
+                <div class="progress-text" style="margin-top: 0;">
+                    <span style="color: var(--danger)">Failures today: 0</span>
+                    <span style="color: var(--warning)">Pending: 21</span>
+                </div>
+                <div class="ticker-list-box">
+                    <strong>Symbols (50):</strong><br>
+                    AAL, AAPL, ABBV, ABEV, ACHR, ACLS, ADBE, ADI, ADT, AEHR, ALGM, ALNY, AMAT, AMD, AMGN, AMKR, AMZN, APLD, APP, ARWR, AVGO, AXP, AZN, BA, BAC, BBAI, BBD, BEAM, BEN, BIIB, BILL, BK, BLK, BMY, BRK-B, BSX, BTG, C, CAMT, CAT, CCC, CCL, CDE, CFLT, CI, CIFR, CLSK, CMCSA, CME, CMI
+                </div>
+            </div>
+        
+            <div class="instance-card active-1">
+                <div class="instance-header">
+                    <h3>Instance 1</h3>
+                    <span class="instance-range">COF - HUBB</span>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" style="width: 40.0%"></div>
+                    </div>
+                    <div class="progress-text">
+                        <span>Synced: <strong>20</strong> / 50</span>
+                        <span>40% Done</span>
+                    </div>
+                </div>
+                <div class="progress-text" style="margin-top: 0;">
+                    <span style="color: var(--danger)">Failures today: 0</span>
+                    <span style="color: var(--warning)">Pending: 30</span>
+                </div>
+                <div class="ticker-list-box">
+                    <strong>Symbols (50):</strong><br>
+                    COF, COHR, COST, COTY, CPNG, CRM, CRSP, CRUS, CRWD, CSCO, CSX, CVS, DAY, DDOG, DE, DFS, DHR, DNN, DOCS, DOCU, DUOL, EDIT, EMR, ESTC, ETN, EXAS, F, FAST, FDX, FOLD, FORM, FTNT, GD, GE, GGB, GH, GILD, GOOG, GOOGL, GRAB, GS, GTLB, GWW, HBAN, HEI, HIMS, HON, HOOD, HSBC, HUBB
+                </div>
+            </div>
+        
+            <div class="instance-card active-2">
+                <div class="instance-header">
+                    <h3>Instance 2</h3>
+                    <span class="instance-range">HUBS - NSC</span>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" style="width: 50.0%"></div>
+                    </div>
+                    <div class="progress-text">
+                        <span>Synced: <strong>25</strong> / 50</span>
+                        <span>50% Done</span>
+                    </div>
+                </div>
+                <div class="progress-text" style="margin-top: 0;">
+                    <span style="color: var(--danger)">Failures today: 0</span>
+                    <span style="color: var(--warning)">Pending: 25</span>
+                </div>
+                <div class="ticker-list-box">
+                    <strong>Symbols (50):</strong><br>
+                    HUBS, HUM, ICE, ILMN, INDI, INSM, INTC, IONQ, IONS, IR, IREN, ISRG, ITUB, ITW, JBLU, JCI, JNJ, JOBY, JPM, KLAC, KVUE, LLY, LMT, LRCX, LUMN, LYFT, MA, MARA, MCHP, MDB, MDT, META, MPWR, MRK, MRNA, MRVL, MS, MSFT, MSTR, MTB, MU, NBIX, NET, NFLX, NGD, NIO, NOC, NOK, NOW, NSC
+                </div>
+            </div>
+        
+            <div class="instance-card active-3">
+                <div class="instance-header">
+                    <h3>Instance 3</h3>
+                    <span class="instance-range">NTLA - SNAP</span>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" style="width: 68.0%"></div>
+                    </div>
+                    <div class="progress-text">
+                        <span>Synced: <strong>34</strong> / 50</span>
+                        <span>68% Done</span>
+                    </div>
+                </div>
+                <div class="progress-text" style="margin-top: 0;">
+                    <span style="color: var(--danger)">Failures today: 0</span>
+                    <span style="color: var(--warning)">Pending: 16</span>
+                </div>
+                <div class="ticker-list-box">
+                    <strong>Symbols (50):</strong><br>
+                    NTLA, NTRA, NTRS, NU, NVDA, NVO, NVTS, NXE, NXPI, OKTA, ON, ONDS, ONTO, OPEN, ORCL, OWL, PANW, PATH, PCOR, PFE, PH, PLTR, PLUG, PNC, PODD, PWR, PYPL, QBTS, QCOM, QRVO, RBLX, RDDT, REGN, RGTI, RIG, RIOT, RIVN, RJF, RKT, ROIV, ROK, RTX, RXRX, S, SAN, SCHW, SITM, SMCI, SMR, SNAP
+                </div>
+            </div>
+        
+            <div class="instance-card active-4">
+                <div class="instance-header">
+                    <h3>Instance 4</h3>
+                    <span class="instance-range">SNOW - ZTS</span>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" style="width: 43.5%"></div>
+                    </div>
+                    <div class="progress-text">
+                        <span>Synced: <strong>20</strong> / 46</span>
+                        <span>43% Done</span>
+                    </div>
+                </div>
+                <div class="progress-text" style="margin-top: 0;">
+                    <span style="color: var(--danger)">Failures today: 0</span>
+                    <span style="color: var(--warning)">Pending: 26</span>
+                </div>
+                <div class="ticker-list-box">
+                    <strong>Symbols (46):</strong><br>
+                    SNOW, SOFI, SOUN, SPLK, SPOT, SRPT, STLA, STT, SWKS, SYF, SYK, T, TEAM, TECH, TFC, TMO, TROW, TSLA, TSM, TWLO, TXN, TXT, U, UAA, UBER, UNH, UNP, UPS, URI, USB, UWMC, V, VALE, VCYT, VRTX, VZ, WBD, WFC, WMT, WOLF, WULF, XYL, XYZ, ZM, ZS, ZTS
+                </div>
+            </div>
+        
+        </div>
+        
+        <!-- Sync logs history -->
+        <h2 class="section-title">Recent Sync History (Daily Summary)</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Sync Status</th>
+                    <th>Records Processed</th>
+                    <th>Duration (Avg/Max)</th>
+                </tr>
+            </thead>
+            <tbody>
+    
+                <tr>
+                    <td><strong>2026-06-15</strong></td>
+                    <td><span class="badge pending">partial</span></td>
+                    <td>1 tickers</td>
+                    <td>12.0s avg / 12.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-15</strong></td>
+                    <td><span class="badge success">success</span></td>
+                    <td>129 tickers</td>
+                    <td>11.6s avg / 16.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-14</strong></td>
+                    <td><span class="badge pending">partial</span></td>
+                    <td>1 tickers</td>
+                    <td>11.0s avg / 11.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-14</strong></td>
+                    <td><span class="badge success">success</span></td>
+                    <td>239 tickers</td>
+                    <td>11.5s avg / 19.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-13</strong></td>
+                    <td><span class="badge pending">partial</span></td>
+                    <td>1 tickers</td>
+                    <td>13.0s avg / 13.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-13</strong></td>
+                    <td><span class="badge success">success</span></td>
+                    <td>239 tickers</td>
+                    <td>10.3s avg / 21.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-12</strong></td>
+                    <td><span class="badge pending">partial</span></td>
+                    <td>1 tickers</td>
+                    <td>11.0s avg / 11.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-12</strong></td>
+                    <td><span class="badge success">success</span></td>
+                    <td>239 tickers</td>
+                    <td>11.1s avg / 18.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-11</strong></td>
+                    <td><span class="badge pending">partial</span></td>
+                    <td>1 tickers</td>
+                    <td>14.0s avg / 14.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-11</strong></td>
+                    <td><span class="badge success">success</span></td>
+                    <td>238 tickers</td>
+                    <td>12.4s avg / 24.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-10</strong></td>
+                    <td><span class="badge pending">partial</span></td>
+                    <td>1 tickers</td>
+                    <td>15.0s avg / 15.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-10</strong></td>
+                    <td><span class="badge success">success</span></td>
+                    <td>239 tickers</td>
+                    <td>13.9s avg / 229.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-09</strong></td>
+                    <td><span class="badge pending">partial</span></td>
+                    <td>1 tickers</td>
+                    <td>12.0s avg / 12.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-09</strong></td>
+                    <td><span class="badge success">success</span></td>
+                    <td>135 tickers</td>
+                    <td>13.6s avg / 25.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-08</strong></td>
+                    <td><span class="badge success">success</span></td>
+                    <td>108 tickers</td>
+                    <td>17.0s avg / 31.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-07</strong></td>
+                    <td><span class="badge success">success</span></td>
+                    <td>12 tickers</td>
+                    <td>9.3s avg / 13.0s max</td>
+                </tr>
+            
+                <tr>
+                    <td><strong>2026-06-06</strong></td>
+                    <td><span class="badge success">success</span></td>
+                    <td>17 tickers</td>
+                    <td>12.7s avg / 19.0s max</td>
+                </tr>
+            
+            </tbody>
+        </table>
+        
+        <!-- Recent Failures -->
+        <h2 class="section-title">Recent Sync Failures & Errors</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Ticker</th>
+                    <th>Sync Type</th>
+                    <th>Error Message</th>
+                </tr>
+            </thead>
+            <tbody>
+    
+                <tr>
+                    <td colspan="4" style="text-align: center; color: var(--success); font-weight: bold;">✓ No sync errors found in the last 20 operations!</td>
+                </tr>
+        
+            </tbody>
+        </table>
+        
+        <div class="footer">
+            Generated automatically on 2026-06-15 17:19:40 &bull; TickZen Stock Database Exporter
+        </div>
+    </div>
+</body>
+</html>
