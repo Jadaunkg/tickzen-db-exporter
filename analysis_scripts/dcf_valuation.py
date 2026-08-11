@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 
 import numpy as np
 import yfinance as yf
@@ -57,6 +58,38 @@ DCF_CYCLICAL_INDUSTRY_KEYWORDS = {
         'airline', 'air transport', 'shipping', 'transport', 'railroad',
     ),
 }
+
+_TNX_CACHE = {'rate': None, 'fetched_at': 0.0}
+_TNX_CACHE_TTL_SECONDS = 24 * 3600
+
+def _get_cached_10y_treasury_yield(fallback=0.043):
+    """
+    Fetch the ^TNX (10Y Treasury yield) risk-free rate, cached for 24 hours so a
+    batch run across thousands of tickers doesn't hit yfinance once per ticker.
+    """
+    now = time.time()
+    if _TNX_CACHE['rate'] is not None and (now - _TNX_CACHE['fetched_at']) < _TNX_CACHE_TTL_SECONDS:
+        return _TNX_CACHE['rate']
+
+    rate = fallback
+    try:
+        _tnx = yf.download("^TNX", period="5d", progress=False, auto_adjust=True)
+        if not _tnx.empty:
+            _tnx_close = _tnx["Close"].dropna()
+            # Handle MultiIndex columns (yfinance 1.x returns DataFrame for ["Close"])
+            if hasattr(_tnx_close, "ndim") and _tnx_close.ndim == 2:
+                if "^TNX" in _tnx_close.columns:
+                    _tnx_close = _tnx_close["^TNX"]
+                elif len(_tnx_close.columns) == 1:
+                    _tnx_close = _tnx_close.iloc[:, 0]
+            if not _tnx_close.empty:
+                rate = float(_tnx_close.iloc[-1]) / 100.0
+    except Exception:
+        pass  # silently use fallback
+
+    _TNX_CACHE['rate'] = rate
+    _TNX_CACHE['fetched_at'] = now
+    return rate
 
 def safe_get(data_dict, key, default="N/A"):
     """Safely get a value from a dictionary, checking for None and NaN."""
@@ -795,21 +828,9 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
         # FIX K: Use yfinance ^TNX (10Y Treasury yield index) - already imported,
         # no new dependencies. FRED fredgraph.json returns [[timestamp, float], ...]
         # arrays, not dicts, so the previous .get("value") parsing always failed silently.
-        risk_free_rate = 0.043  # fallback: 10Y US Treasury
-        try:
-            _tnx = yf.download("^TNX", period="5d", progress=False, auto_adjust=True)
-            if not _tnx.empty:
-                _tnx_close = _tnx["Close"].dropna()
-                # FIX K: Handle MultiIndex columns (yfinance 1.x returns DataFrame for ["Close"])
-                if hasattr(_tnx_close, "ndim") and _tnx_close.ndim == 2:
-                    if "^TNX" in _tnx_close.columns:
-                        _tnx_close = _tnx_close["^TNX"]
-                    elif len(_tnx_close.columns) == 1:
-                        _tnx_close = _tnx_close.iloc[:, 0]
-                if not _tnx_close.empty:
-                    risk_free_rate = float(_tnx_close.iloc[-1]) / 100.0
-        except Exception:
-            pass  # silently use hardcoded fallback
+        # Cached for 24h (see _get_cached_10y_treasury_yield) so a batch run across
+        # thousands of tickers doesn't re-fetch this once per ticker.
+        risk_free_rate = _get_cached_10y_treasury_yield()
 
         # ERP: Damodaran implied ERP, updated annually. Last confirmed: Jan 2025 = 4.60%.
         # Kept as a configurable constant rather than fetched - Damodaran publishes monthly

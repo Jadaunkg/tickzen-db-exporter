@@ -275,9 +275,9 @@ def run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index,
         logger.info(f"Assigned workload: {len(sliced_tickers)} stocks.")
         run_limit = limit_val if limit_val is not None else 70
 
-    # Query DB to check today's sync statuses
+    # Query DB to check today's sync statuses (scoped to this instance's assigned tickers only)
     try:
-        db_stocks = db.table('stocks').select('symbol', 'last_sync_date').execute()
+        db_stocks = db.table('stocks').select('symbol', 'last_sync_date').in_('symbol', sliced_tickers).execute()
         db_map = {}
         for s in db_stocks.data:
             symbol = s['symbol'].upper()
@@ -474,12 +474,13 @@ def main():
 
     # Determine execution window check for single runs
     if args.once and not args.force:
-        now = datetime.now()
-        current_hour = now.hour
-        current_minute = now.minute
+        utc_now = datetime.now(timezone.utc)
+        ist_now = utc_now + timedelta(hours=5, minutes=30)
+        current_hour = ist_now.hour
+        current_minute = ist_now.minute
         is_allowed = 7 <= current_hour < 18 or (current_hour == 18 and current_minute <= 30)
         if not is_allowed:
-            logger.info(f"Outside allowed database export window (07:00 to 18:30 IST). Execution skipped. Use --force to override.")
+            logger.info(f"Outside allowed database export window (07:00 to 18:30 IST). Current IST: {ist_now.strftime('%H:%M')}. Execution skipped. Use --force to override.")
             sys.exit(0)
 
     # 1. Connectivity Check
@@ -511,6 +512,13 @@ def main():
     
     sub_batch_size = args.sub_batch_size if args.sub_batch_size is not None else (int(env_sub_batch_size) if env_sub_batch_size else 70)
     sleep_interval_seconds = args.batch_sleep if args.batch_sleep is not None else (int(env_batch_sleep) if env_batch_sleep else 4200)
+
+    # Ensure the dashboard generator sees the same instance partitioning as this
+    # run, even if it was supplied via --instance-index/--total-instances flags
+    # rather than the INSTANCE_INDEX/TOTAL_INSTANCES env vars.
+    if instance_index is not None:
+        os.environ['INSTANCE_INDEX'] = str(instance_index)
+    os.environ['TOTAL_INSTANCES'] = str(total_instances)
 
     if args.once:
         # Run once and exit (e.g. for Cron run)

@@ -434,11 +434,11 @@ class SmartStockUpdater:
             
             # 7. Insert market price snapshot
             logger.info("  [7/12] Inserting market price snapshot...")
-            snapshot_record = self.mapper.map_market_price_snapshot(
+            snapshot_record = self.mapper.map_market_snapshot(
                 stock_id,
-                collected_data['processed_data'],
                 collected_data.get('current_price'),
-                collected_data['info']
+                collected_data['info'],
+                collected_data['processed_data']
             )
             
             self.db.client.table('market_price_snapshot').upsert(

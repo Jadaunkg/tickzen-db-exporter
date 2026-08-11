@@ -47,4 +47,4 @@ jobs:
         INSTANCE_INDEX: ${{ matrix.instance_index }}
         TOTAL_INSTANCES: 5
       run: |
-        python database/cron_update_runner.py --force
+        python database/cron_update_runner.py --once --force

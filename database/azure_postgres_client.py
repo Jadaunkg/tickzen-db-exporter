@@ -455,6 +455,19 @@ class AzurePostgresClient:
                         conn.rollback()
                 except Exception as rollback_err:
                     logger.warning(f"Rollback failed during error recovery: {rollback_err}")
+
+                # Non-transient errors (bad SQL, constraint violations, bad data) will
+                # never succeed on retry - fail fast instead of wasting up to
+                # 2^max_retries seconds sleeping before raising the same error anyway.
+                if POSTGRES_AVAILABLE and isinstance(error, (
+                    psycopg2.errors.IntegrityError,
+                    psycopg2.errors.ProgrammingError,
+                    psycopg2.errors.DataError,
+                    psycopg2.errors.NotSupportedError,
+                )):
+                    logger.error(f"Non-retryable query error, failing immediately: {error}")
+                    raise AzurePostgresQueryError(f"Query failed: {error}") from error
+
                 if attempt < self.max_retries - 1:
                     wait_time = 2**attempt
                     self.retry_count += 1

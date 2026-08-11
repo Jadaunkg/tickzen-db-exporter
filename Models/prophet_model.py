@@ -301,11 +301,6 @@ def _train_prophet_model_wsl(data, ticker='STOCK', forecast_horizon='1y', timest
     changepoint_prior_scale = params['changepoint_prior_scale']
     seasonality_mode = params['seasonality_mode']
 
-    # ----- Special Handling (e.g., TSLA stock split adjustment) -----
-    if ticker == 'TSLA':
-        split_date = pd.to_datetime('2020-08-31')
-        data.loc[data['Date'] < split_date, 'Close'] *= 5
-
     # ----- Dynamic Cap Calculation -----
     max_price = data['Close'].max() * cap_multiplier
     data['cap'] = max_price
@@ -494,11 +489,6 @@ def _train_prophet_model_native(data, ticker='STOCK', forecast_horizon='1y', tim
     cap_multiplier = params['cap_multiplier']
     changepoint_prior_scale = params['changepoint_prior_scale']
     seasonality_mode = params['seasonality_mode']
-
-    # ----- Special Handling (e.g., TSLA stock split adjustment) -----
-    if ticker == 'TSLA':
-        split_date = pd.to_datetime('2020-08-31')
-        data.loc[data['Date'] < split_date, 'Close'] *= 5
 
     # ----- Dynamic Cap Calculation -----
     max_price = data['Close'].max() * cap_multiplier

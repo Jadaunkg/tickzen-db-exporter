@@ -770,16 +770,21 @@ def fetch_stock_data(
                     # Distinguish between delisted/invalid stock and a rate limit block by attempting a history fetch
                     try:
                         # If rate limited, this will raise an exception (YFRateLimitError or HTTPError)
-                        yf_ticker.history(period="1d", raise_errors=True)
+                        hist_check = yf_ticker.history(period="1d", raise_errors=True)
                     except Exception as hist_err:
                         # Raise to be caught by the outer attempt loop exception handler (which registers rate limit)
                         raise hist_err
 
-                    logger.error(
-                        f"Ticker {ticker} appears invalid/unavailable (missing symbol/regularMarketPrice in info)."
-                    )
-                    _set_last_fetch_error(ticker, 'invalid_or_unavailable', 'Ticker info missing symbol/regularMarketPrice')
-                    return None
+                    if hist_check is None or hist_check.empty:
+                        logger.error(
+                            f"Ticker {ticker} appears invalid/unavailable (missing symbol/regularMarketPrice in info, and no history data)."
+                        )
+                        _set_last_fetch_error(ticker, 'invalid_or_unavailable', 'Ticker info missing symbol/regularMarketPrice and history empty')
+                        return None
+
+                    # History fetch succeeded with real data, so the ticker is valid -
+                    # the info payload was just momentarily incomplete. Proceed with the normal download below.
+                    logger.info(f"Ticker {ticker} info payload was incomplete but history fetch succeeded; proceeding with historical download.")
 
                 download_params = {
                     'tickers': ticker,
