@@ -61,6 +61,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+NEW_STOCKS_LOCK_INDEX = 1000   # worker lock of the new-stock loader (nightly workers use 0..WORKER_COUNT-1)
 RATE_LIMIT_MARKERS = ('rate_limited', 'too many requests', 'rate limit', '429', 'invalid crumb', 'crumb', 'unauthorized')
 
 
@@ -108,10 +109,11 @@ def load_tickers_from_db(db) -> list:
     return [s for s in (str(r.get('symbol') or '').strip().upper() for r in rows) if s and not (s in seen or seen.add(s))]
 
 
-def build_queue(db, tickers: list, cutoff: datetime, worker_index: int, worker_count: int):
+def build_queue(db, tickers: list, cutoff: datetime, worker_index: int, worker_count: int, new_only: bool = False):
     """Returns (own, others, counts): stale stocks of this worker's part and of the other parts.
 
-    Each list: stocks not yet in ``stocks`` first, then the rest by oldest successful sync.
+    Each list: stocks not yet in ``stocks`` first, then the rest by oldest successful sync. With ``new_only`` (the
+    new-stock loader) every never-synced stock is "own" and nothing else is queued.
     """
     db_map = {s['symbol'].upper(): s for s in
               db.table('stocks').select('symbol', 'last_sync_date', 'last_sync_status').execute().data}
@@ -124,8 +126,13 @@ def build_queue(db, tickers: list, cutoff: datetime, worker_index: int, worker_c
         return new + old
 
     home = assign_parts(tickers, worker_count)
-    stale = [s for s in tickers if s not in db_map
-             or not is_current(db_map[s].get('last_sync_date'), db_map[s].get('last_sync_status'), cutoff)]
+    if new_only:
+        # Never synced: not in ``stocks`` yet, or only an earnings-page row without any export.
+        stale = [s for s in tickers if s not in db_map or not db_map[s].get('last_sync_date')]
+        home = {s: worker_index for s in tickers}
+    else:
+        stale = [s for s in tickers if s not in db_map
+                 or not is_current(db_map[s].get('last_sync_date'), db_map[s].get('last_sync_status'), cutoff)]
     own = [s for s in stale if home[s] == worker_index]
     others = [s for s in stale if home[s] != worker_index]
     counts = {
@@ -137,6 +144,18 @@ def build_queue(db, tickers: list, cutoff: datetime, worker_index: int, worker_c
         'others_stale': len(others),
     }
     return order(own), order(others), counts
+
+
+def recently_failed(db, hours: int) -> set:
+    """Symbols whose latest attempt in the last ``hours`` failed (the new-stock loader does not retry them yet)."""
+    try:
+        rows = db.execute_raw_sql(
+            "SELECT DISTINCT ON (symbol) symbol, status FROM updater_run_stocks "
+            "WHERE finished_at > now() - make_interval(hours => %s) ORDER BY symbol, finished_at DESC", [hours])
+        return {r['symbol'].upper() for r in rows if r['status'] not in ('success', 'partial')}
+    except Exception as exc:  # the run log is optional
+        logger.warning(f"Could not read recent failures: {exc}")
+        return set()
 
 
 def is_rate_limited(errors) -> bool:
@@ -169,6 +188,9 @@ def main():
 
     worker_index = env_int("WORKER_INDEX", 0)
     worker_count = max(1, env_int("WORKER_COUNT", 1))
+    # New-stock loader: a separate frequent job that gives newly added stocks their first full load at any hour.
+    new_only = os.getenv("NEW_STOCKS_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+    retry_failed_after_hours = env_int("NEW_STOCKS_RETRY_HOURS", 6)
     help_others = os.getenv("HELP_OTHER_WORKERS", "true").strip().lower() in {"1", "true", "yes", "on"}
     max_rate_limited = env_int("MAX_CONSECUTIVE_RATE_LIMITED", 3)
     stop_after_429 = env_int("STOP_AFTER_429", 3)
@@ -180,12 +202,15 @@ def main():
         sys.exit(1)
 
     from database.updater_run_log import RunLog
-    log_meta = dict(worker_name=os.getenv("WORKER_NAME") or f"azure-{worker_index}", worker_index=worker_index,
+    default_name = "azure-new-stocks" if new_only else f"azure-{worker_index}"
+    log_meta = dict(worker_name=os.getenv("WORKER_NAME") or default_name, worker_index=worker_index,
                     worker_count=worker_count, region=os.getenv("WORKER_REGION"), image_tag=os.getenv("IMAGE_TAG"),
                     pace_per_hour=yahoo_per_hour)
 
     def window_open() -> bool:
-        return args.force or in_export_window(datetime.now(MARKET_TZ), start_et, stop_et)
+        # A first load runs at any hour: a bar stored during the session is replaced by that night's update
+        # (the price export re-reads the last 7 days), because the stock is stale again after the close.
+        return args.force or new_only or in_export_window(datetime.now(MARKET_TZ), start_et, stop_et)
 
     now_et = datetime.now(MARKET_TZ)
     if not window_open():
@@ -240,11 +265,22 @@ def main():
 
     # 4. Initial queue
     try:
-        own, others, counts = build_queue(db, all_tickers, cutoff, worker_index, worker_count)
+        own, others, counts = build_queue(db, all_tickers, cutoff, worker_index, worker_count, new_only=new_only)
     except Exception as e:
         logger.error(f"❌ Failed to fetch stocks from database: {e}")
         run_log.seen(f"error: could not read stocks ({e})")
         sys.exit(1)
+    skipped: set = set()
+    if new_only:
+        skipped = recently_failed(db, retry_failed_after_hours) & set(own)
+        own = [s for s in own if s not in skipped]
+        if skipped:
+            logger.info(f"Not retrying yet (failed in the last {retry_failed_after_hours} h): {', '.join(sorted(skipped))}")
+        if not own:
+            logger.info("✓ No new stocks waiting for their first load.")
+            if not args.preview:
+                run_log.seen("no new stocks to load" + (f" ({len(skipped)} recently failed)" if skipped else ""))
+            sys.exit(0)
     logger.info("Queue Status:")
     logger.info(f"  - Monitored stocks: {counts['total']} (this worker's part: {counts['own_total']})")
     logger.info(f"  - Current since the last close: {counts['current']}")
@@ -266,8 +302,9 @@ def main():
 
     from database.updater_locks import UpdaterLocks
     locks = UpdaterLocks(db)
-    if not locks.worker(worker_index):
-        logger.info(f"Worker {worker_index} is already running elsewhere. Exiting.")
+    lock_index = NEW_STOCKS_LOCK_INDEX if new_only else worker_index
+    if not locks.worker(lock_index):
+        logger.info(f"{'New-stock loader' if new_only else f'Worker {worker_index}'} is already running elsewhere. Exiting.")
         sys.exit(0)
 
     # 5. Export loop: plan the next stocks, claim each one right before exporting it.
@@ -277,7 +314,7 @@ def main():
     attempted = set()   # never retry a stock twice in one run (a partial stock would loop forever)
     success_count = fail_count = partial_count = helped = 0
     consecutive_rate_limited = 0
-    earnings_done = False
+    earnings_done = new_only   # the earnings step belongs to the nightly workers
     plan: list = []
     own_set = set(own)
     first_plan = True
@@ -303,7 +340,9 @@ def main():
             break
         if not plan:
             if not first_plan:
-                own, others, _ = build_queue(db, all_tickers, cutoff, worker_index, worker_count)
+                own, others, _ = build_queue(db, all_tickers, cutoff, worker_index, worker_count, new_only=new_only)
+                if new_only:
+                    own = [s for s in own if s not in skipped]
                 own_set = set(own)
             first_plan = False
             own_left = [s for s in own if s not in attempted]

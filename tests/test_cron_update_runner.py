@@ -36,8 +36,12 @@ class FakePacer:
 class World:
     """Shared state of the fakes: which stocks are current and which another worker holds."""
 
-    def __init__(self, held_by_other=(), pacer=None):
+    def __init__(self, held_by_other=(), pacer=None, new_symbols=(), failed_recently=(), market_open=False):
         self.current = set()
+        self.new_symbols = list(new_symbols)          # never-synced stocks (for the new-stock loader)
+        self.failed_recently = set(failed_recently)
+        self.market_open = market_open
+        self.lock_indexes = []
         self.held_by_other = set(held_by_other)
         self.exported = []
         self.earnings_runs = 0
@@ -62,7 +66,8 @@ def run(monkeypatch):
             def __init__(self, _db):
                 pass
 
-            def worker(self, _index):
+            def worker(self, index):
+                world.lock_indexes.append(index)
                 return True
 
             def earnings(self):
@@ -93,7 +98,11 @@ def run(monkeypatch):
             def finish(self, status, **_k):
                 world.finished = status
 
-        def build_queue(_db, tickers, _cutoff, index, count):
+        def build_queue(_db, tickers, _cutoff, index, count, new_only=False):
+            if new_only:
+                own = [s for s in world.new_symbols if s not in world.current]
+                return own, [], {"total": len(tickers), "own_total": len(own), "current": 0, "new": len(own),
+                                 "own_stale": len(own), "others_stale": 0}
             parts = runner.assign_parts(tickers, count)
             stale = [s for s in tickers if s not in world.current]
             own = [s for s in stale if parts[s] == index]
@@ -105,7 +114,8 @@ def run(monkeypatch):
         import database.updater_locks as locks_module
         import database.updater_run_log as log_module
         import database.export_to_azure_postgres as export_module
-        monkeypatch.setattr(runner, "in_export_window", lambda *_a: True)
+        monkeypatch.setattr(runner, "in_export_window", lambda *_a: not world.market_open)
+        monkeypatch.setattr(runner, "recently_failed", lambda _db, _hours: set(world.failed_recently))
         monkeypatch.setattr(runner, "internet_and_ip", lambda: (True, "203.0.113.7"))
         monkeypatch.setattr(runner, "get_exporter_and_client", lambda: (Exporter(), object()))
         monkeypatch.setattr(runner, "load_tickers_from_db", lambda _db: list(SYMBOLS))
@@ -158,3 +168,31 @@ def test_three_real_429s_end_the_run(run):
 def test_limit_can_be_changed(run):
     world = run(World(), env={"STOCKS_PER_RUN": "10"})
     assert len(world.exported) == 10 and world.finished == "batch_done"
+
+
+NEW_ENV = {"NEW_STOCKS_ONLY": "1", "STOCKS_PER_RUN": "10", "WORKER_INDEX": "0", "WORKER_COUNT": "1"}
+
+
+def test_new_stock_loader_runs_while_the_market_is_open(run):
+    world = run(World(new_symbols=["NEWA", "NEWB", "NEWC"], market_open=True), env=NEW_ENV)
+    assert world.exported == ["NEWA", "NEWB", "NEWC"]
+    assert world.finished == "completed"
+    assert world.earnings_runs == 0                      # the earnings step stays with the nightly workers
+    assert world.lock_indexes == [runner.NEW_STOCKS_LOCK_INDEX]
+
+
+def test_new_stock_loader_caps_each_run_and_skips_recent_failures(run):
+    new = [f"N{i:02d}" for i in range(15)]
+    world = run(World(new_symbols=new, failed_recently={"N00", "N01"}), env=NEW_ENV)
+    assert world.exported == new[2:12]                   # 10 per run, the two recent failures are not retried
+    assert world.finished == "batch_done"
+
+
+def test_new_stock_loader_exits_quietly_when_nothing_is_new(run):
+    world = run(World(new_symbols=[]), env=NEW_ENV)
+    assert world.exported == [] and world.finished is None
+
+
+def test_nightly_worker_still_waits_for_the_close(run):
+    world = run(World(market_open=True))
+    assert world.exported == [] and world.finished is None

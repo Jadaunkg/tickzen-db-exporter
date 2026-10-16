@@ -21,8 +21,28 @@
 # WORKER_COUNT must be the same on every worker. When you change it, redeploy every worker with the new value
 # (SKIP_BUILD=1 is enough); stocks are re-split automatically.
 #
+# New-stock loader (JOB_MODE=new-stocks): job tickzen-db-new-stocks, every 15 minutes at any hour, gives stocks
+# that were just added to monitored_tickers their first full load (at most 10 per run). Put it in a region no
+# nightly worker uses, so it has its own outbound IP and Yahoo budget:
+#   JOB_MODE=new-stocks LOCATION=southeastasia SKIP_BUILD=1 deploy/azure/deploy_container_apps_job.sh
+#
 # Prerequisites: `brew install azure-cli`, `az login`, `az extension add -n containerapp`.
 set -euo pipefail
+
+JOB_MODE="${JOB_MODE:-worker}"
+if [[ "$JOB_MODE" == "new-stocks" ]]; then
+  WORKER_INDEX="${WORKER_INDEX:-0}"
+  WORKER_COUNT="${WORKER_COUNT:-1}"
+  JOB_NAME="${JOB_NAME:-tickzen-db-new-stocks}"
+  CRON_EXPRESSION="${CRON_EXPRESSION:-*/15 * * * *}"
+  REPLICA_TIMEOUT_SECONDS="${REPLICA_TIMEOUT_SECONDS:-1800}"
+  YAHOO_REQUESTS_PER_HOUR="${YAHOO_REQUESTS_PER_HOUR:-900}"
+  STOCKS_PER_RUN="${STOCKS_PER_RUN:-10}"
+  RUN_TIME_BUDGET_MINUTES="${RUN_TIME_BUDGET_MINUTES:-13}"
+  EXTRA_ENV_YAML='          - {name: NEW_STOCKS_ONLY, value: "1"}
+          - {name: WORKER_NAME, value: "azure-new-stocks"}'
+fi
+EXTRA_ENV_YAML="${EXTRA_ENV_YAML:-}"
 
 : "${WORKER_INDEX:?set WORKER_INDEX (0-based)}"
 : "${WORKER_COUNT:?set WORKER_COUNT (total workers, same on every worker)}"
@@ -142,6 +162,7 @@ properties:
           - {name: STOCKS_PER_RUN, value: "${STOCKS_PER_RUN}"}
           - {name: RUN_TIME_BUDGET_MINUTES, value: "${RUN_TIME_BUDGET_MINUTES}"}
           - {name: STOP_AFTER_429, value: "3"}
+${EXTRA_ENV_YAML}
           - {name: TICKZEN_RATE_LIMIT_BACKEND, value: "local"}
           - {name: TZ, value: "Asia/Kolkata"}
           - {name: AZURE_POSTGRES_HOST, value: "${PG_HOST}"}
@@ -181,7 +202,7 @@ fi
 
 cat <<EOF
 
-Done: worker $((WORKER_INDEX + 1)) of ${WORKER_COUNT} = job ${JOB_NAME} in ${LOCATION}, image ${IMAGE}.
+Done: ${JOB_MODE} job ${JOB_NAME} (worker $((WORKER_INDEX + 1)) of ${WORKER_COUNT}) in ${LOCATION}, image ${IMAGE}.
   Run now:          az containerapp job start -g ${RESOURCE_GROUP} -n ${JOB_NAME}
   History:          az containerapp job execution list -g ${RESOURCE_GROUP} -n ${JOB_NAME} -o table
   Logs:             az containerapp job logs show -g ${RESOURCE_GROUP} -n ${JOB_NAME} --container exporter --follow
