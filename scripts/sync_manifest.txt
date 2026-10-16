@@ -1,0 +1,93 @@
+# Files copied verbatim from tickzen-github by scripts/sync_from_tickzen.sh.
+# This is the full import closure of tickzen-github's database/cron_update_runner.py plus the data
+# files it reads at runtime, and the other shared modules kept identical so nothing here goes stale.
+
+# --- package markers
+Models/__init__.py
+analysis_scripts/__init__.py
+app/__init__.py
+config/__init__.py
+data_processing_scripts/__init__.py
+database/__init__.py
+earnings_reports/__init__.py
+
+# --- forecasting
+Models/forecast_core.py
+Models/prophet_model.py
+Models/wsl_prophet_bridge.py
+
+# --- analysis
+analysis_scripts/dashboard_analytics.py
+analysis_scripts/dcf_valuation.py
+analysis_scripts/firestore_dashboard_analytics.py
+analysis_scripts/fundamental_analysis.py
+analysis_scripts/peer_comparison.py
+analysis_scripts/peer_margin_builder.py
+analysis_scripts/reddit_sentiment_analyzer.py
+analysis_scripts/risk_analysis.py
+analysis_scripts/risk_free_rate_fetcher.py
+analysis_scripts/sentiment_analysis.py
+analysis_scripts/technical_analysis.py
+
+# --- config
+config/config.py
+config/realtime_config.py
+
+# --- data collection / processing
+data_processing_scripts/data_collection.py
+data_processing_scripts/data_preprocessing.py
+data_processing_scripts/date_utils.py
+data_processing_scripts/feature_engineering.py
+data_processing_scripts/macro_data.py
+
+# --- database exporter
+database/azure_postgres_client.py
+database/batch_export_stocks.py
+database/data_mapper.py
+database/earnings_local_update.py
+database/export_analyst_detail.py
+database/export_earnings_history.py
+database/export_to_azure_postgres.py
+database/export_to_supabase.py
+database/extract_schema.py
+database/financial_contract.py
+database/init_database.py
+database/pipeline_data_collector.py
+database/setup_azure_schema.py
+database/smart_updater.py
+database/stock_registry.py
+database/supabase_client.py
+database/supabase_queries.py
+database/unit_contract.py
+database/updater_locks.py
+database/updater_run_log.py
+database/updater_schedule.py
+database/validate_unit_contract.py
+
+# --- runtime data: unit registry, ticker universe, migrations applied by the earnings/analyst exporters
+database/UNIT_CONTRACT.md
+database/column_units.json
+database/stock_tickers_list.json
+database/migrations/20261004_earnings_history.sql
+database/migrations/20261005_earnings_runup.sql
+database/migrations/20261006_analyst_detail.sql
+database/migrations/20261016_analyst_eps_trend.sql
+database/migrations/20261016_updater_runs.sql
+
+# --- schema references
+database/COMPLETE_DATABASE_SCHEMA.sql
+database/TICKZEN_SUPABASE_SCHEMA_CURRENT.sql
+database/create_news_table.sql
+database/supabase_schema.sql
+
+# --- earnings
+earnings_reports/adjusted_earnings_calculator.py
+earnings_reports/cash_sustainability_analyzer.py
+earnings_reports/data_collector.py
+earnings_reports/data_processor.py
+earnings_reports/earnings_config.py
+earnings_reports/earnings_history.py
+earnings_reports/enhanced_data_extractor.py
+earnings_reports/finnhub_financials.py
+earnings_reports/one_time_items_extractor.py
+earnings_reports/rate_limit.py

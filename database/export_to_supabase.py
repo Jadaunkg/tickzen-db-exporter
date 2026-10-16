@@ -27,6 +27,7 @@ import argparse
 import logging
 import time
 import re
+import json
 from datetime import datetime
 from typing import List, Dict
 
@@ -40,8 +41,19 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 from database.pipeline_data_collector import PipelineDataCollector
 from database.data_mapper import DataMapper
+from Models.forecast_core import PIPELINE_VERSION as TICKZEN_PROPHET_PIPELINE_VERSION
 from database.supabase_client import SupabaseClient
 from analysis_scripts.risk_analysis import RiskAnalyzer
+from database.financial_contract import (
+    SCHEMA_VERSION,
+    CALCULATION_VERSION,
+    PartialProviderData,
+    carry_forward_snapshot_size,
+    finite_float,
+    next_earnings_date as upcoming_earnings_date,
+    normalized_exchange,
+    stable_content_hash,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -229,6 +241,9 @@ class SupabaseDataExporter:
         
         sanitized = []
         for record in records:
+            if not isinstance(record, dict):
+                logger.warning("Skipping non-object record while building canonical snapshot")
+                continue
             sanitized_record = {}
             for key, value in record.items():
                 if value is None:
@@ -245,6 +260,118 @@ class SupabaseDataExporter:
             sanitized.append(sanitized_record)
         
         return sanitized
+
+    @staticmethod
+    def _snapshot_stock_metadata(ticker: str, info: Dict) -> Dict:
+        """Keep listing identity and currencies in the canonical snapshot."""
+        quote_currency = (info.get('currency') or '').strip().upper() or None
+        financial_currency = (
+            info.get('financialCurrency') or info.get('currency') or ''
+        ).strip().upper() or None
+        exchange = info.get('exchange')
+        return {
+            'symbol': ticker,
+            'company_name': info.get('shortName') or info.get('longName') or ticker,
+            'sector': info.get('sector'),
+            'industry': info.get('industry'),
+            'country': info.get('country'),
+            'exchange': exchange,
+            'normalized_exchange': normalized_exchange(exchange),
+            'quote_currency': quote_currency,
+            'financial_currency': financial_currency,
+            'security_type': info.get('quoteType'),
+        }
+
+    @staticmethod
+    def _snapshot_peer_records(peer_records: List[Dict], peer_data: Dict) -> List[Dict]:
+        """Attach per-listing currency metadata without changing legacy table rows."""
+        metadata_by_ticker = {
+            str(ticker).strip().upper(): metrics
+            for ticker, metrics in (peer_data or {}).items()
+            if isinstance(metrics, dict)
+        }
+        snapshots = []
+        for record in peer_records or []:
+            if not isinstance(record, dict):
+                continue
+            metrics = metadata_by_ticker.get(
+                str(record.get('peer_ticker') or '').strip().upper(),
+                {},
+            )
+            raw_currency = record.get('quote_currency') or metrics.get('quote_currency')
+            quote_currency = (
+                raw_currency.strip().upper()
+                if isinstance(raw_currency, str) and raw_currency.strip()
+                else None
+            )
+            exchange = metrics.get('exchange') or record.get('exchange')
+            snapshots.append({
+                **record,
+                'quote_currency': quote_currency,
+                'normalized_exchange': normalized_exchange(exchange),
+                'exchange': exchange,
+                'country': metrics.get('country') or record.get('country'),
+            })
+        return snapshots
+
+    def _validate_snapshot_payload(self, payload: Dict) -> List[str]:
+        """Validate the minimum invariants for a publishable stock snapshot.
+
+        A current read-model must identify the stock, contain a positive finite
+        market price, and never expose malformed forecast uncertainty bands.
+        Empty optional sections are allowed when the upstream provider did not
+        return those facts; present forecast rows, however, must be complete
+        and ordered (low <= base <= high).
+        """
+        errors: List[str] = []
+        if not isinstance(payload, dict):
+            return ["snapshot payload must be an object"]
+
+        ticker = str(payload.get("ticker") or "").strip().upper()
+        stock = payload.get("stock")
+        if not ticker:
+            errors.append("ticker is required")
+        if not isinstance(stock, dict):
+            errors.append("stock metadata is required")
+        elif str(stock.get("symbol") or "").strip().upper() != ticker:
+            errors.append("stock.symbol must match ticker")
+
+        market = payload.get("market_price")
+        if not isinstance(market, dict):
+            errors.append("market_price is required")
+        else:
+            current_price = finite_float(market.get("current_price"))
+            if current_price is None or current_price <= 0:
+                errors.append("market_price.current_price must be a positive finite number")
+
+        forecasts = payload.get("forecast", [])
+        if forecasts is None:
+            forecasts = []
+        if not isinstance(forecasts, list):
+            errors.append("forecast must be an array")
+        else:
+            for index, row in enumerate(forecasts):
+                if not isinstance(row, dict):
+                    errors.append(f"forecast[{index}] must be an object")
+                    continue
+                values = {
+                    field: finite_float(row.get(field))
+                    for field in ("low_price", "base_price", "high_price")
+                }
+                missing = [field for field, value in values.items() if value is None]
+                if missing:
+                    errors.append(f"forecast[{index}] missing finite {', '.join(missing)}")
+                    continue
+                if not (values["low_price"] <= values["base_price"] <= values["high_price"]):
+                    errors.append(f"forecast[{index}] uncertainty bands are not ordered")
+
+        # This catches nested provider values that bypass the record sanitizer
+        # (for example a Decimal/NumPy scalar converted during serialization).
+        try:
+            json.dumps(payload, allow_nan=False, default=str)
+        except (TypeError, ValueError, OverflowError) as exc:
+            errors.append(f"snapshot contains non-JSON values: {exc}")
+        return errors
 
     def _extract_unknown_column(self, error: Exception, expected_table: str) -> str | None:
         """
@@ -276,43 +403,19 @@ class SupabaseDataExporter:
 
         return None
 
-    def _upsert_with_schema_fallback(self, table_name: str, records: List[Dict], on_conflict: str):
-        """
-        Upsert records and gracefully handle schema drift by removing unknown columns
-        reported by PostgREST (PGRST204).
+    def _upsert_required_schema(self, table_name: str, records: List[Dict], on_conflict: str):
+        """Upsert records and fail closed when the deployed schema is incompatible.
+
+        Silently removing an unknown column can publish an internally incomplete
+        record while reporting success.  Migrations and readers are versioned, so
+        schema drift must stop this batch before it becomes public.
         """
         if not records:
             return
-
-        working_records = [dict(record) for record in records]
-        removed_columns = set()
-
-        for _ in range(10):
-            try:
-                self.db.client.table(table_name).upsert(
-                    working_records,
-                    on_conflict=on_conflict
-                ).execute()
-                return
-            except Exception as error:
-                unknown_column = self._extract_unknown_column(error, table_name)
-                if not unknown_column:
-                    raise
-
-                if unknown_column in removed_columns:
-                    raise
-
-                removed_columns.add(unknown_column)
-                for record in working_records:
-                    record.pop(unknown_column, None)
-
-                logger.warning(
-                    f"  ⚠ Column '{unknown_column}' missing in '{table_name}' schema; retrying without it"
-                )
-
-        raise RuntimeError(
-            f"Unable to upsert into {table_name}: too many schema fallback retries"
-        )
+        self.db.client.table(table_name).upsert(
+            [dict(record) for record in records],
+            on_conflict=on_conflict,
+        ).execute()
     
     def _is_forecast_updated_this_month(self, stock_id: int) -> bool:
         """
@@ -332,6 +435,7 @@ class SupabaseDataExporter:
             result = self.db.client.table('forecast_data')\
                 .select('forecast_date')\
                 .eq('stock_id', stock_id)\
+                .eq('model_version', TICKZEN_PROPHET_PIPELINE_VERSION)\
                 .gte('created_at', f'{current_month}-01')\
                 .limit(1)\
                 .execute()
@@ -362,6 +466,24 @@ class SupabaseDataExporter:
         except Exception as e:
             logger.warning(f"Error checking weekly analyst update status: {e}")
         return False
+
+    def _analyst_earnings_date_is_stale(self, stock_id: int, info: Dict) -> bool:
+        """True when the stored next_earnings_date no longer matches what the provider reports now.
+
+        Analyst targets are refreshed weekly, but an earnings date goes stale the day the report
+        happens (and moves when the company reschedules). Without this check a recently refreshed row
+        keeps a past/outdated date for up to a week. The refresh is the same single-row analyst update,
+        so it costs nothing extra: ``info`` is already fetched.
+        """
+        try:
+            fresh = upcoming_earnings_date(info or {})
+            res = self.db.client.table('analyst_data').select('next_earnings_date').eq('stock_id', stock_id).execute()
+            stored = res.data[0].get('next_earnings_date') if res.data else None
+            stored = str(stored)[:10] if stored else None
+            return stored != fresh
+        except Exception as e:
+            logger.warning(f"Error checking earnings-date freshness: {e}")
+            return False
 
     def _is_ownership_data_updated_this_week(self, stock_id: int) -> bool:
         """Check if ownership/short interest data was updated in the last 7 days."""
@@ -445,7 +567,13 @@ class SupabaseDataExporter:
             return False
     
 
-    def _filter_new_records_only(self, data, latest_db_date: str, date_column: str = 'Date'):
+    def _filter_new_records_only(
+        self,
+        data,
+        latest_db_date: str,
+        date_column: str = 'Date',
+        overlap_days: int = 0,
+    ):
         """
         Filter dataframe to only include records newer than the latest database date
         
@@ -481,6 +609,10 @@ class SupabaseDataExporter:
             # Convert dates for comparison
             data_dates = pd.to_datetime(data[date_column], errors='coerce')
             latest_db_datetime = pd.to_datetime(latest_db_date)
+            # Recent upstream history can be corrected. Keep a bounded overlap
+            # so the destination upsert can repair those rows by natural key.
+            if overlap_days > 0:
+                latest_db_datetime -= pd.Timedelta(days=overlap_days)
             
             # Filter to only records newer than latest DB date
             mask = data_dates > latest_db_datetime
@@ -499,7 +631,62 @@ class SupabaseDataExporter:
         except Exception as e:
             logger.warning(f"Error filtering new records: {e}")
             return data  # Return original data if filtering fails
+
+    def _verify_stock_sync_persisted(self, stock_id: int, expected_status: str) -> None:
+        """Verify the final stock sync marker is readable after the write."""
+        verification = self.db.client.table('stocks')\
+            .select('id, last_sync_date, last_sync_status')\
+            .eq('id', stock_id)\
+            .limit(1)\
+            .execute()
+
+        if not verification.data:
+            raise RuntimeError(
+                f"Post-write verification failed: stock ID {stock_id} was not readable"
+            )
+
+        row = verification.data[0]
+        if not row.get('last_sync_date'):
+            raise RuntimeError(
+                f"Post-write verification failed: stock ID {stock_id} has no last_sync_date"
+            )
+        if row.get('last_sync_status') != expected_status:
+            raise RuntimeError(
+                f"Post-write verification failed: expected status {expected_status!r}, "
+                f"got {row.get('last_sync_status')!r} for stock ID {stock_id}"
+            )
     
+    def _fetch_ttm_cashflow(self, ticker: str):
+        """Trailing-twelve-month cash-flow statement (OCF / capex / FCF), or None. One Yahoo request, never fatal."""
+        try:
+            import yfinance as yf
+            from earnings_reports.earnings_history import yahoo_call
+
+            return yahoo_call(lambda: yf.Ticker(ticker).ttm_cashflow)
+        except Exception as exc:  # noqa: BLE001 - FCF is left empty rather than failing the stock
+            logger.warning(f"  ⚠ TTM cash-flow statement unavailable for {ticker}: {exc}")
+            return None
+
+    def _carry_forward_snapshot_size(self, stock_id: int, snapshot_record: Dict) -> None:
+        """Fill market cap / EV / share counts that Yahoo left empty today from the last complete snapshot."""
+        if all(finite_float(snapshot_record.get(f)) for f in ('market_cap', 'enterprise_value', 'shares_outstanding', 'float_shares')):
+            return
+        run_sql = getattr(self.db.client, 'execute_raw_sql', None)
+        if not callable(run_sql):
+            return
+        try:
+            rows = run_sql(
+                "SELECT date, current_price, market_cap, enterprise_value, shares_outstanding, float_shares "
+                "FROM market_price_snapshot WHERE stock_id = %s AND market_cap IS NOT NULL AND date < %s "
+                "ORDER BY date DESC LIMIT 1",
+                [stock_id, snapshot_record.get('date')],
+            )
+            if rows:
+                carry_forward_snapshot_size(snapshot_record, rows[0])
+                logger.info("  ℹ Market snapshot size fields were empty; carried forward from the last complete snapshot")
+        except Exception as exc:  # noqa: BLE001 - never block the export for a cosmetic fill
+            logger.warning(f"  ⚠ Could not carry forward snapshot size fields: {exc}")
+
     def export_stock_data(self, ticker: str) -> Dict:
         """
         Complete export workflow for a single stock
@@ -548,6 +735,18 @@ class SupabaseDataExporter:
                 logger.warning(f"Data validation issues: {issues}")
                 result['errors'].extend(issues)
                 result['status'] = 'partial'
+
+            # A partial collection is not safe to publish table-by-table. Keep
+            # the existing public rows untouched; the scheduler will retry it
+            # because no successful sync marker is advanced.
+            if result['status'] != 'success':
+                result['duration_seconds'] = int(time.time() - start_time)
+                logger.warning(
+                    "Publication blocked for %s: collection/validation status is %s",
+                    ticker,
+                    result['status'],
+                )
+                return result
             
             # Step 2: Transform and export data
             logger.info("\nPHASE 2: DATA TRANSFORMATION & EXPORT")
@@ -561,19 +760,22 @@ class SupabaseDataExporter:
             
             # First, check if the stock already exists and has a valid profile updated this month
             existing_stock = self.db.client.table('stocks')\
-                .select('id, updated_at, company_name')\
+                .select('id, updated_at, company_name, sector')\
                 .eq('symbol', ticker)\
                 .execute()
-            
+
             stock_id = None
             profile_needs_update = True
-            
+
             if existing_stock.data:
                 stock_id = existing_stock.data[0]['id']
                 company_name = existing_stock.data[0].get('company_name')
                 updated_at_val = existing_stock.data[0].get('updated_at')
-                
-                if company_name and updated_at_val:
+
+                # updated_at moves on every sync, so a row blanked by an empty Yahoo profile
+                # (company_name = ticker, no sector) must be re-written whenever a profile is at hand.
+                has_profile = bool(existing_stock.data[0].get('sector')) and company_name != ticker
+                if company_name and updated_at_val and has_profile:
                     try:
                         current_month = datetime.now().strftime('%Y-%m')
                         
@@ -610,17 +812,10 @@ class SupabaseDataExporter:
             if not profile_needs_update:
                 logger.info("  ⏭️  Company profile already updated this month - skipping profile update")
                 
-                # Even though we skip the full profile update, we still need to update sync timestamps
-                # Use UPDATE instead of UPSERT to only touch timestamp fields and avoid NULL violations
-                self.db.client.table('stocks').update(
-                    {
-                        'updated_at': datetime.now().isoformat(),
-                        'last_sync_date': datetime.now().isoformat(),
-                        'last_sync_status': 'success'
-                    }
-                ).eq('id', stock_id).execute()
-                
-                logger.info("  ✓ Updated sync timestamps")
+                # Sync markers are written only after all export phases and the
+                # sync log succeed; otherwise a later failure could leave a
+                # false success marker.
+                logger.info("  ✓ Profile skipped; final sync markers deferred")
                 result['records_exported']['stocks'] = 0  # Track as skipped
             else:
                 # Update full company profile
@@ -632,12 +827,20 @@ class SupabaseDataExporter:
                 
                 # Ensure we update the correct ID
                 stock_record['id'] = stock_id
-                
+
+                if not collected_data.get('info'):
+                    # Yahoo sent no profile: keep the stored name/sector/industry, refresh only the coverage dates.
+                    logger.warning(f"  ⚠️  Empty company profile for {ticker} - keeping the stored profile")
+                    stock_record = {
+                        key: stock_record[key]
+                        for key in ('id', 'symbol', 'data_start_date', 'data_end_date', 'total_records')
+                    }
+
                 stock_result = self.db.client.table('stocks').upsert(
                     stock_record,
                     on_conflict='symbol'
                 ).execute()
-                
+
                 logger.info(f"  ✓ Stock profile updated: ID = {stock_id}")
                 result['records_exported']['stocks'] = 1
                 self.mapper.sync_stats['records_inserted'] += 1
@@ -670,7 +873,8 @@ class SupabaseDataExporter:
             incremental_price_data = self._filter_new_records_only(
                 filtered_price_data, 
                 latest_price_date, 
-                'Date'
+                'Date',
+                overlap_days=7,
             )
             
             if incremental_price_data is not None and len(incremental_price_data) > 0:
@@ -718,7 +922,8 @@ class SupabaseDataExporter:
             incremental_indicators_data = self._filter_new_records_only(
                 processed_filtered,
                 latest_indicators_date, 
-                'Date'
+                'Date',
+                overlap_days=7,
             )
             
             if incremental_indicators_data is not None and len(incremental_indicators_data) > 0:
@@ -732,7 +937,7 @@ class SupabaseDataExporter:
                 total_inserted = 0
                 for i in range(0, len(tech_records), batch_size):
                     batch = tech_records[i:i+batch_size]
-                    self._upsert_with_schema_fallback(
+                    self._upsert_required_schema(
                         table_name='technical_indicators',
                         records=batch,
                         on_conflict='stock_id,date'
@@ -750,7 +955,10 @@ class SupabaseDataExporter:
             
             # 2.4: Export analyst data (one record per stock)
             logger.info("\n[4/11] Exporting analyst data...")
-            if self._is_analyst_data_updated_this_week(stock_id):
+            if (
+                self._is_analyst_data_updated_this_week(stock_id)
+                and not self._analyst_earnings_date_is_stale(stock_id, collected_data['info'])
+            ):
                 logger.info("  ⏭️  Analyst data already updated this week - skipping")
                 result['records_exported']['analyst_data'] = 0
             else:
@@ -773,6 +981,41 @@ class SupabaseDataExporter:
                     logger.warning(f"  ⚠️  Could not export analyst data: {e}")
                     result['records_exported']['analyst_data'] = 0
             
+            # 2.4b: Earnings history + price reactions (Azure only; skipped if checked within 24h).
+            # Non-fatal: an earnings-data problem must never fail the stock's main export.
+            try:
+                if callable(getattr(self.db.client, 'execute_raw_sql', None)):
+                    from database.export_earnings_history import refresh_if_stale
+                    earnings_summary = refresh_if_stale(self.db.client, {'id': stock_id, 'symbol': ticker.upper()})
+                    if earnings_summary is None:
+                        logger.info("  ⏭️  Earnings history checked within 24h - skipping")
+                        result['records_exported']['earnings_history'] = 0
+                    else:
+                        logger.info(f"  ✓ Earnings history: {earnings_summary.get('rows', 0)} quarters "
+                                    f"({earnings_summary.get('with_reaction', 0)} with price reaction)")
+                        result['records_exported']['earnings_history'] = earnings_summary.get('rows', 0)
+                        self.mapper.sync_stats['records_inserted'] += earnings_summary.get('rows', 0)
+            except Exception as e:
+                logger.warning(f"  ⚠️  Could not export earnings history: {e}")
+                result['records_exported']['earnings_history'] = 0
+
+            # 2.4c: Analyst detail behind the forecast tab (rating breakdown, firm actions, EPS/revenue estimates).
+            # Azure only; skipped if fetched within the week. Non-fatal for the same reason as 2.4b.
+            try:
+                if callable(getattr(self.db.client, 'execute_raw_sql', None)):
+                    from database.export_analyst_detail import refresh_if_stale as refresh_analyst_detail
+                    detail_summary = refresh_analyst_detail(self.db.client, {'id': stock_id, 'symbol': ticker.upper()})
+                    if detail_summary is None:
+                        logger.info("  ⏭️  Analyst detail fetched this week - skipping")
+                        result['records_exported']['analyst_detail_data'] = 0
+                    else:
+                        logger.info(f"  ✓ Analyst detail: {', '.join(detail_summary.get('datasets', [])) or 'nothing available'}")
+                        result['records_exported']['analyst_detail_data'] = 1
+                        self.mapper.sync_stats['records_inserted'] += 1
+            except Exception as e:
+                logger.warning(f"  ⚠️  Could not export analyst detail: {e}")
+                result['records_exported']['analyst_detail_data'] = 0
+
             # 2.5: Export forecast data (12 monthly forecasts - updated monthly only)
             logger.info("\n[5/11] Exporting forecast data...")
             
@@ -784,13 +1027,23 @@ class SupabaseDataExporter:
                 forecast_records = self.mapper.map_forecast_data(
                     stock_id,
                     collected_data['forecast_data'],
-                    collected_data['info']
+                    collected_data['info'],
+                    collected_data.get('forecast_metadata'),
                 )
                 
                 if forecast_records:
-                    # Delete existing forecasts for this stock first, then insert new
-                    self.db.client.table('forecast_data').delete().eq('stock_id', stock_id).execute()
-                    self.db.client.table('forecast_data').insert(forecast_records).execute()
+                    # Azure replacement is a single transaction so a failed
+                    # insert cannot expose an empty forecast table.
+                    replace_atomic = getattr(self.db.client, 'replace_rows_atomic', None)
+                    if callable(replace_atomic):
+                        replace_atomic('forecast_data', {'stock_id': stock_id}, forecast_records)
+                    else:
+                        # Legacy PostgREST fallback is non-destructive: publish
+                        # the new version without deleting the last-known-good.
+                        self.db.client.table('forecast_data').upsert(
+                            forecast_records,
+                            on_conflict='stock_id,forecast_date,forecast_period',
+                        ).execute()
                     logger.info(f"  ✓ Exported {len(forecast_records)} forecast records")
                     result['records_exported']['forecast_data'] = len(forecast_records)
                     self.mapper.sync_stats['records_inserted'] += len(forecast_records)
@@ -801,21 +1054,28 @@ class SupabaseDataExporter:
             
             # 2.6: Export fundamental data
             logger.info("\n[6/12] Exporting fundamental data...")
-            fundamental_record = self.mapper.map_fundamental_data(
-                stock_id,
-                collected_data['info'],
-                collected_data.get('balance_sheet'),
-                collected_data.get('financials'),
-                ticker=ticker
-            )
-            
-            self.db.client.table('fundamental_data').upsert(
-                [fundamental_record],
-                on_conflict='stock_id,period_date,period_type'
-            ).execute()
-            logger.info(f"  ✓ Exported fundamental metrics")
-            result['records_exported']['fundamental_data'] = 1
-            self.mapper.sync_stats['records_inserted'] += 1
+            try:
+                fundamental_record = self.mapper.map_fundamental_data(
+                    stock_id,
+                    collected_data['info'],
+                    collected_data.get('balance_sheet'),
+                    collected_data.get('financials'),
+                    ticker=ticker,
+                    ttm_cashflow=self._fetch_ttm_cashflow(ticker),
+                )
+            except PartialProviderData as exc:
+                # A stub payload must not replace the last good row (it used to: AVGO/JPM/DHR were blanked).
+                logger.warning(f"  ⚠ Skipping fundamental data, nothing written: {exc}")
+                fundamental_record = None
+
+            if fundamental_record is not None:
+                self.db.client.table('fundamental_data').upsert(
+                    [fundamental_record],
+                    on_conflict='stock_id,period_date,period_type'
+                ).execute()
+                logger.info(f"  ✓ Exported fundamental metrics")
+                result['records_exported']['fundamental_data'] = 1
+                self.mapper.sync_stats['records_inserted'] += 1
             
             # 2.6b: Export quarterly fundamental data
             logger.info("\n[6b/12] Exporting quarterly fundamental data...")
@@ -936,7 +1196,8 @@ class SupabaseDataExporter:
                 collected_data['info'],
                 collected_data['processed_data']
             )
-            
+            self._carry_forward_snapshot_size(stock_id, snapshot_record)
+
             self.db.client.table('market_price_snapshot').upsert(
                 [snapshot_record],
                 on_conflict='stock_id,date'
@@ -1016,7 +1277,9 @@ class SupabaseDataExporter:
                 news_records = self.mapper.map_stock_news_data(
                     stock_id,
                     news_articles,
-                    ticker
+                    ticker,
+                    company_name=collected_data.get('info', {}).get('shortName')
+                    or collected_data.get('info', {}).get('longName'),
                 )
                 
                 if news_records:
@@ -1080,9 +1343,15 @@ class SupabaseDataExporter:
                     batch_size = 1000
                     for i in range(0, len(insider_records), batch_size):
                         batch = insider_records[i:i+batch_size]
+                        has_accessions = all(record.get('accession_number') for record in batch)
+                        conflict_key = (
+                            'stock_id,accession_number,transaction_date,shares_change'
+                            if has_accessions else
+                            'stock_id,insider_name,transaction_date,shares_change'
+                        )
                         self.db.client.table('insider_transactions').upsert(
                             batch,
-                            on_conflict='stock_id,insider_name,transaction_date,shares_change',
+                            on_conflict=conflict_key,
                             ignore_duplicates=True
                         ).execute()
                         total_inserted += len(batch)
@@ -1105,14 +1374,16 @@ class SupabaseDataExporter:
                 )
                 
                 if peer_records:
-                    # Delete existing peer data for this stock
-                    self.db.client.table('peer_comparison_data').delete().eq('stock_id', stock_id).execute()
-                    
-                    # Insert new peer data
-                    self.db.client.table('peer_comparison_data').upsert(
-                        peer_records,
-                        on_conflict='stock_id,peer_ticker'
-                    ).execute()
+                    replace_atomic = getattr(self.db.client, 'replace_rows_atomic', None)
+                    if callable(replace_atomic):
+                        replace_atomic('peer_comparison_data', {'stock_id': stock_id}, peer_records)
+                    else:
+                        # Do not delete first on legacy clients; stale extras are
+                        # safer than exposing an empty peer section on failure.
+                        self.db.client.table('peer_comparison_data').upsert(
+                            peer_records,
+                            on_conflict='stock_id,peer_ticker',
+                        ).execute()
                     logger.info(f"  ✓ Exported {len(peer_records)} peer comparison records")
                     result['records_exported']['peer_comparison_data'] = len(peer_records)
                     self.mapper.sync_stats['records_inserted'] += len(peer_records)
@@ -1120,7 +1391,89 @@ class SupabaseDataExporter:
                     logger.info("  ℹ No peer comparison data to export")
             else:
                 logger.info("  ℹ Peer comparison data not available")
-            
+
+            # Publish a compact canonical read-model only after every required
+            # table write above has completed. The previous current snapshot is
+            # retained if this publication fails, preserving last-known-good
+            # semantics for readers.
+            market_price_records = self._sanitize_records_for_json(
+                [snapshot_record] if isinstance(snapshot_record, dict) else []
+            )
+            peer_snapshot_records = self._snapshot_peer_records(
+                peer_records if 'peer_records' in locals() else [],
+                collected_data.get('peer_comparison') or {},
+            )
+            snapshot_payload = {
+                'ticker': ticker,
+                'stock': self._sanitize_records_for_json([self._snapshot_stock_metadata(
+                    ticker,
+                    collected_data.get('info', {}),
+                )])[0],
+                'market_price': market_price_records[0] if market_price_records else {},
+                'forecast': self._sanitize_records_for_json(forecast_records if 'forecast_records' in locals() else []),
+                # Include the validated point-in-time records needed by the
+                # ticker adapter.  Historical series remain in their source
+                # tables; this keeps the canonical read model bounded while
+                # allowing consumers to load one internally consistent batch.
+                'analyst': self._sanitize_records_for_json([analyst_record] if 'analyst_record' in locals() else []),
+                'fundamental': self._sanitize_records_for_json([fundamental_record] if 'fundamental_record' in locals() else []),
+                'risk': self._sanitize_records_for_json([risk_record] if 'risk_record' in locals() else []),
+                'liquidity_risk': self._sanitize_records_for_json([liquidity_record] if 'liquidity_record' in locals() else []),
+                'altman_zscore': self._sanitize_records_for_json([altman_record] if 'altman_record' in locals() else []),
+                'regime_risk': self._sanitize_records_for_json([regime_record] if 'regime_record' in locals() else []),
+                'sentiment': self._sanitize_records_for_json([sentiment_record] if 'sentiment_record' in locals() else []),
+                'dividend': self._sanitize_records_for_json([dividend_record] if 'dividend_record' in locals() else []),
+                'ownership': self._sanitize_records_for_json([ownership_record] if 'ownership_record' in locals() else []),
+                'news': self._sanitize_records_for_json(news_records if 'news_records' in locals() else []),
+                'peers': self._sanitize_records_for_json(peer_snapshot_records),
+                'schema_version': SCHEMA_VERSION,
+                'calculation_version': CALCULATION_VERSION,
+            }
+            snapshot_validation_errors = self._validate_snapshot_payload(snapshot_payload)
+            if snapshot_validation_errors:
+                logger.error("  ✗ Canonical snapshot rejected: %s", snapshot_validation_errors)
+                result['errors'].extend(
+                    f"canonical_snapshot: {error}" for error in snapshot_validation_errors
+                )
+                result['status'] = 'partial'
+                result['records_exported']['stock_page_snapshot'] = 0
+            else:
+                snapshot_row = {
+                    'stock_id': stock_id,
+                    'ticker': ticker,
+                    'schema_version': SCHEMA_VERSION,
+                    'calculation_version': CALCULATION_VERSION,
+                    'source_batch_id': f"{ticker}-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                    'market_price_as_of': snapshot_payload['market_price'].get('date'),
+                    'fundamentals_period_end': (
+                        snapshot_payload['fundamental'][0].get('period_date')
+                        if snapshot_payload.get('fundamental') else None
+                    ),
+                    'generated_at': datetime.now().isoformat(),
+                    'quality_status': result['status'],
+                    'quality_score': 100 if result['status'] == 'success' else 0,
+                    'validation_errors': result['errors'],
+                    'snapshot_json': snapshot_payload,
+                    'content_hash': stable_content_hash(snapshot_payload),
+                    'is_current': result['status'] == 'success',
+                }
+                try:
+                    publish_snapshot = getattr(self.db.client, 'publish_stock_page_snapshot', None)
+                    if callable(publish_snapshot):
+                        publish_snapshot(snapshot_row)
+                    else:
+                        self.db.client.table('stock_page_snapshot').upsert(
+                            [snapshot_row], on_conflict='stock_id,content_hash'
+                        ).execute()
+                    result['records_exported']['stock_page_snapshot'] = 1
+                    self.mapper.sync_stats['records_inserted'] += 1
+                except Exception as snapshot_error:
+                    # Keep compatibility with pre-migration deployments while
+                    # surfacing the missing publication capability in diagnostics.
+                    logger.warning("  ⚠️ Canonical snapshot publication unavailable: %s", snapshot_error)
+                    result['errors'].append(f'canonical_snapshot: {snapshot_error}')
+                    result['status'] = 'partial'
+
             # Step 3: Create sync log
             logger.info("\nPHASE 3: SYNC LOGGING")
             logger.info("-" * 40)
@@ -1142,17 +1495,21 @@ class SupabaseDataExporter:
             logger.info("-" * 40)
             
             # Use UPDATE instead of UPSERT to only touch timestamp fields and avoid NULL violations
-            update_data = {
-                'updated_at': datetime.now().isoformat(),
-                'last_sync_status': result['status']  # success, partial, or failed
-            }
-            # Only update last_sync_date if the sync succeeded or had partial data (i.e. not completely failed)
-            if result['status'] in ('success', 'partial'):
-                update_data['last_sync_date'] = datetime.now().isoformat()
-
-            self.db.client.table('stocks').update(update_data).eq('id', stock_id).execute()
+            self.db.client.table('stocks').update(
+                {
+                    'updated_at': datetime.now().isoformat(),
+                    'last_sync_date': datetime.now().isoformat(),
+                    'last_sync_status': result['status']  # success, partial, or failed
+                }
+            ).eq('id', stock_id).execute()
             
             logger.info(f"  ✓ Final sync timestamps updated for stock ID {stock_id}")
+
+            # Confirm the final marker can be read back from the database. This
+            # catches false-positive success states where the write call returns
+            # but the update is not actually visible/persisted.
+            self._verify_stock_sync_persisted(stock_id, result['status'])
+            logger.info(f"  ✓ Post-write verification passed for stock ID {stock_id}")
             
             # Calculate total records
             total_records = sum(result['records_exported'].values())

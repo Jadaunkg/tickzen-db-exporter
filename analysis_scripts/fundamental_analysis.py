@@ -431,12 +431,17 @@ def extract_financial_health(fundamentals: dict):
     """Extracts key financial health metrics."""
     info = fundamentals.get('info', {})
 
-    # FIX: Correct for potential percentage-based Debt/Equity from yfinance
+    # yfinance's debtToEquity is always reported as a percentage
+    # (Total Debt / Total Equity * 100), e.g. 6.555 means a 6.555% (0.06555)
+    # ratio, not "6.555x". The previous ">10.0" heuristic only divided when
+    # the raw value looked unusually high, which silently left genuinely
+    # low-leverage companies un-corrected (verified against NVDA: raw
+    # debtToEquity of 6.555 with $12.8B total debt only makes sense at the
+    # 0.06555 scale, implying ~$195B equity - not ~$1.96B).
     debt_equity_raw = safe_get(info, 'debtToEquity')
     debt_equity_corrected = debt_equity_raw
     try:
-        # Heuristic: If D/E ratio is unusually high, assume it was given as a percentage
-        if debt_equity_raw != "N/A" and float(debt_equity_raw) > 10.0:
+        if debt_equity_raw != "N/A":
             debt_equity_corrected = float(debt_equity_raw) / 100.0
     except (ValueError, TypeError):
         # If conversion fails, keep the original value
@@ -479,12 +484,11 @@ def extract_profitability(fundamentals: dict):
 
 def _format_dividend_yield(yield_value):
     """
-    Helper function to properly return dividend yield values from yfinance.
-    CRITICAL FIX: Returns the numeric value as-is (not formatted with % symbol).
-    The display functions will handle the percentage formatting.
-    
-    yfinance returns dividend yields as decimal values (e.g., 0.02 for 2%).
-    This function just validates and returns the numeric value for later formatting.
+    Validate a dividend yield expressed in percentage points and preserve its unit.
+
+    Report renderers use ``percent_direct`` (e.g. 0.02 means 0.02%), so this
+    function must not multiply or divide the provider value. Derived yields in
+    ``extract_dividends_splits`` are also returned in percentage points.
     """
     if yield_value == "N/A" or yield_value is None:
         return "N/A"
@@ -493,9 +497,29 @@ def _format_dividend_yield(yield_value):
         yield_float = float(yield_value)
         # Return the raw numeric value (not multiplied by 100, not formatted with %)
         # The display functions will apply percent_direct formatting
+        if not np.isfinite(yield_float) or yield_float < 0:
+            return "N/A"
         return yield_float
     except (ValueError, TypeError):
         return "N/A"
+
+
+def _derive_dividend_yield_percentage_points(annual_dividend, quote_price):
+    """Derive yield in percentage points from annual cash per share and price."""
+    try:
+        annual_dividend = float(annual_dividend)
+        quote_price = float(quote_price)
+    except (ValueError, TypeError):
+        return None
+    if (
+        not np.isfinite(annual_dividend)
+        or not np.isfinite(quote_price)
+        or annual_dividend < 0
+        or quote_price <= 0
+    ):
+        return None
+    return (annual_dividend / quote_price) * 100.0
+
 
 def extract_dividends_splits(fundamentals: dict):
     """
@@ -504,32 +528,33 @@ def extract_dividends_splits(fundamentals: dict):
     """
     info = fundamentals.get('info', {})
     
-    # Get trailing dividend yield with fallback calculation.
-    # IMPORTANT: yfinance returns trailingAnnualDividendYield in true decimal form
-    # (e.g. 0.000225 = 0.02%) while dividendYield / fiveYearAvgDividendYield are
-    # already in percentage-point form (e.g. 0.02 = 0.02%).  We normalise the
-    # trailing value to percentage-point form by multiplying by 100 so that
-    # percent_direct formatting shows the correct figure.
-    _trailing_raw = safe_get(info, 'trailingAnnualDividendYield')
-    trailing_div_yield = None
-    if _trailing_raw is not None and _trailing_raw != "N/A":
-        try:
-            trailing_div_yield = float(_trailing_raw) * 100  # decimal → percentage-point
-        except (ValueError, TypeError):
-            trailing_div_yield = None
+    # Derive current, forward and trailing yields from annual cash per share
+    # and the matching quote where possible.
+    # Yahoo's precomputed trailing-yield field has appeared in inconsistent
+    # scales, so it is not used without unit metadata.
+    current_price = safe_get(info, 'currentPrice') or safe_get(info, 'regularMarketPrice')
+    dividend_yield = _derive_dividend_yield_percentage_points(
+        safe_get(info, 'dividendRate'), current_price
+    )
+    if dividend_yield is None:
+        # Existing provider contract: dividendYield is stored as percentage points.
+        dividend_yield = safe_get(info, 'dividendYield')
 
-    # If still missing or effectively zero, calculate from rate / price
-    if not trailing_div_yield:
-        trailing_div_rate = safe_get(info, 'trailingAnnualDividendRate')
-        current_price = safe_get(info, 'currentPrice')
-        if trailing_div_rate and current_price and trailing_div_rate != "N/A" and current_price != "N/A":
-            try:
-                # rate/price is also decimal form → multiply by 100
-                trailing_div_yield = (float(trailing_div_rate) / float(current_price)) * 100
-            except (ValueError, TypeError, ZeroDivisionError):
-                trailing_div_yield = safe_get(info, 'dividendYield')  # already in pct-point form
-        else:
-            trailing_div_yield = safe_get(info, 'dividendYield')  # already in pct-point form
+    forward_rate = safe_get(info, 'forwardDividendRate')
+    if forward_rate in (None, "N/A"):
+        forward_rate = safe_get(info, 'dividendRate')
+    forward_div_yield = _derive_dividend_yield_percentage_points(forward_rate, current_price)
+    if forward_div_yield is None:
+        forward_div_yield = safe_get(info, 'forwardDividendYield')
+
+    trailing_div_rate = safe_get(info, 'trailingAnnualDividendRate')
+    trailing_div_yield = _derive_dividend_yield_percentage_points(
+        trailing_div_rate, current_price
+    )
+
+    if trailing_div_yield is None:
+        # Existing producer contract: dividendYield is stored as percentage points.
+        trailing_div_yield = safe_get(info, 'dividendYield')
     
     # Use the helper function to properly format dividend yields
     # instead of relying on format_value's 'percent_direct' which assumes 
@@ -537,11 +562,11 @@ def extract_dividends_splits(fundamentals: dict):
     
     metrics = {
         "Dividend Rate": format_value(safe_get(info, 'dividendRate'), 'currency'),
-        "Dividend Yield": _format_dividend_yield(safe_get(info, 'dividendYield')),
+        "Dividend Yield": _format_dividend_yield(dividend_yield),
         "Payout Ratio": format_value(safe_get(info, 'payoutRatio'), 'percent'),
         "5 Year Average Dividend Yield": _format_dividend_yield(safe_get(info, 'fiveYearAvgDividendYield')),
         "Forward Annual Dividend Rate": format_value(safe_get(info, 'forwardDividendRate'), 'currency'),
-        "Forward Annual Dividend Yield": _format_dividend_yield(safe_get(info, 'forwardDividendYield')),
+        "Forward Annual Dividend Yield": _format_dividend_yield(forward_div_yield),
         "Trailing Dividend Rate": format_value(safe_get(info, 'trailingAnnualDividendRate'), 'currency'),
         "Trailing Dividend Yield": _format_dividend_yield(trailing_div_yield),
         "Ex-Dividend Date": format_value(safe_get(info, 'exDividendDate'), 'date'),
@@ -604,10 +629,10 @@ def extract_analyst_info(fundamentals: dict):
 
 def extract_news(fundamentals: dict, ticker=None):
     """
-    Fetches ticker-specific news directly from yfinance and filters to articles
+    Ticker-specific news (``fundamentals['news']``, else one Yahoo search request) filtered to articles
     that are genuinely relevant to the requested ticker.
 
-    yfinance's .news feed is a *mixed* feed — it includes both ticker-specific
+    Yahoo's news feed is a *mixed* feed — it includes both ticker-specific
     articles and general market/sector articles.  We apply relevance filtering
     on title + summary to keep only articles that actually mention the ticker
     symbol or the company name.
@@ -661,10 +686,12 @@ def extract_news(fundamentals: dict, ticker=None):
         thumb = content.get('thumbnail')
         if not isinstance(thumb, dict):
             return ''
-        for res in thumb.get('resolutions', []):
-            if isinstance(res, dict) and res.get('tag') == '170x128':
-                return res.get('url', '')
-        return thumb.get('originalUrl', '')
+        sizes = [res for res in thumb.get('resolutions', []) if isinstance(res, dict) and res.get('url')]
+        for res in sizes:
+            if res.get('tag') == '170x128':
+                return res['url']
+        # Yahoo search results carry 'original' / '140x140' sizes instead
+        return thumb.get('originalUrl') or (sizes[-1]['url'] if sizes else '')
 
     # ── Helper: parse one raw yfinance news item ──────────────────────────────
     def _parse_item(item: dict):
@@ -696,7 +723,7 @@ def extract_news(fundamentals: dict, ticker=None):
                 'thumbnail': _thumbnail_url(content),
             }
 
-        # Legacy flat-dict structure
+        # Flat-dict structure (Yahoo search results, see data_collection.fetch_ticker_news)
         title = item.get('title', '').strip()
         if not title:
             return None
@@ -705,8 +732,8 @@ def extract_news(fundamentals: dict, ticker=None):
             'publisher': item.get('publisher', 'N/A'),
             'link':      _extract_url(item.get('link', '#')),
             'published': format_value(item.get('providerPublishTime'), 'date'),
-            'summary':   '',
-            'thumbnail': '',
+            'summary':   (item.get('summary') or '').strip(),
+            'thumbnail': _thumbnail_url(item),
         }
 
     # ── Main logic ────────────────────────────────────────────────────────────
@@ -714,17 +741,14 @@ def extract_news(fundamentals: dict, ticker=None):
     search_terms  = _build_search_terms(ticker, fundamentals)
     raw_items     = []
 
-    # Primary: live fetch keyed to this ticker
-    if ticker:
+    # Primary: news the caller already fetched (same source); a live fetch only when there is none
+    raw_items = fundamentals.get('news') or []
+    if not raw_items and ticker:
         try:
-            from data_processing_scripts.data_collection import _yf_ticker
-            raw_items = _yf_ticker(ticker).news or []
+            from data_processing_scripts.data_collection import fetch_ticker_news
+            raw_items = fetch_ticker_news(ticker)
         except Exception as e:
-            logging.warning(f"extract_news: yfinance fetch failed for {ticker}: {e}")
-
-    # Fallback: pre-fetched data already in fundamentals dict
-    if not raw_items:
-        raw_items = fundamentals.get('news') or []
+            logging.warning(f"extract_news: Yahoo news fetch failed for {ticker}: {e}")
 
     # Parse all items first
     parsed_all = [p for item in raw_items if (p := _parse_item(item)) is not None]
@@ -1072,14 +1096,24 @@ def extract_financial_efficiency_data(fundamentals: dict):
 def extract_stock_price_stats_data(fundamentals: dict):
     """Extracts data for the Stock Price Statistics section."""
     info = fundamentals.get('info', {})
+
+    # yfinance has renamed these fields over time ('fiftyTwoWeekChange' -> '52WeekChange',
+    # 'averageVolume3Month' -> 'averageDailyVolume3Month'/'averageVolume'); check both.
+    week_52_change = safe_get(info, 'fiftyTwoWeekChange', safe_get(info, '52WeekChange'))
+    avg_volume_3m = safe_get(
+        info, 'averageVolume3Month',
+        safe_get(info, 'averageDailyVolume3Month', safe_get(info, 'averageVolume'))
+    )
+
     metrics = {
         "52 Week High": format_value(safe_get(info, 'fiftyTwoWeekHigh'), 'currency'),
         "52 Week Low": format_value(safe_get(info, 'fiftyTwoWeekLow'), 'currency'),
         "50 Day MA": format_value(safe_get(info, 'fiftyDayAverage'), 'currency'),
         "200 Day MA": format_value(safe_get(info, 'twoHundredDayAverage'), 'currency'),
-        "52 Week Change": format_value(safe_get(info, 'fiftyTwoWeekChange'), 'percent_direct'),
+        # yfinance reports this as a fraction (0.25 == 25%), so it needs 'percent' not 'percent_direct'.
+        "52 Week Change": format_value(week_52_change, 'percent'),
         "Beta": format_value(safe_get(info, 'beta'), 'ratio'),
-        "Average Volume (3 month)": format_value(safe_get(info, 'averageVolume3Month'), 'integer')
+        "Average Volume (3 month)": format_value(avg_volume_3m, 'integer')
     }
     return metrics
 

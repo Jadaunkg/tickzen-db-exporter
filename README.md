@@ -1,209 +1,136 @@
-# TickZen Standalone Database Exporter
+# TickZen Database Exporter
 
-This is a completely standalone backend pipeline project for extracting stock data from free APIs (`yfinance`, `finnhub`, `FRED`) and exporting/syncing it to an external database (Azure PostgreSQL or Supabase).
+Standalone nightly updater for the TickZen production stock database (Azure PostgreSQL, the database behind
+the `/stocks/<ticker>` pages). Per stock it runs the **same export** as
+`tickzen-github/database/cron_update_runner.py` (the macOS launchd job `com.tickzen.dbupdater`), split across
+several workers that each run on Azure in a different region.
 
-It is isolated from the main TickZen Flask application portal to allow lightweight, multi-instance background daemon deployments on free cloud platforms (like Render).
+## How it stays identical to tickzen-github
 
----
+Every pipeline module is a byte-for-byte copy of tickzen-github, listed in `scripts/sync_manifest.txt`
+(the full import closure of the runner plus the runtime data it reads: `column_units.json`, the
+earnings/analyst migrations). After changing the pipeline in tickzen-github:
 
-## Why Is This Project Isolated?
-Free market data APIs place strict limits on how many requests can be made from a single IP address. Making thousands of requests concurrently will result in temporary or permanent IP bans. 
-
-To resolve this:
-1. The 1,600+ ticker stock list is split into **batches of 300–400 stocks**.
-2. **5 different Render services** are deployed (which are free under Render's free tier).
-3. Each Render deployment is configured with a specific **limit and offset** (e.g. Service 1 processes tickers 0-400, Service 2 processes 400-800, etc.).
-4. This distributes the API request load across 5 different egress IPs, successfully bypassing API rate limits.
-
----
-
-## Directory Structure
-
-```
-tickzen-db-exporter/
-├── .env.example
-├── .gitignore
-├── Dockerfile
-├── README.md
-├── requirements.txt
-├── app/
-│   └── html_components.py        # Mocked dependencies (currency helper)
-├── database/
-│   ├── azure_postgres_client.py  # Azure client
-│   ├── supabase_client.py        # Supabase client
-│   ├── cron_update_runner.py     # Main Cron/batch script
-│   ├── smart_updater.py          # Smart update logic (daily/weekly/monthly)
-│   ├── pipeline_data_collector.py# Data ingestion pipeline
-│   ├── data_mapper.py            # DB schema mapping
-│   ├── export_to_azure_postgres.py # Direct Azure entrypoint
-│   ├── export_to_supabase.py     # Direct Supabase entrypoint
-│   └── stock_tickers_list.json   # Full list of stock tickers
-├── data_processing_scripts/      # Preprocessing, indicators, macro data
-├── Models/                       # Prophet forecasting models
-└── analysis_scripts/             # Core analytical engines
-```
-
----
-
-## Local Setup & Installation
-
-1. **Create and activate a virtual environment**:
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Configure Environment Variables**:
-   Copy `.env.example` to `.env` and fill in your actual credentials:
-   ```bash
-   cp .env.example .env
-   ```
-
----
-
-## How it Works: Smart Update Strategy
-
-The export pipeline (`smart_updater.py`) does not upload all data every single time. It categorizes database tables to optimize performance:
-
-* **DAILY Update (Fast Incremental, 3–5 seconds per stock)**:
-  - Updates: `daily_price_data`, `technical_indicators`, `market_price_snapshot`, `sentiment_data`.
-  - Only fetches prices since the last recorded date in the database.
-* **WEEKLY Update**:
-  - Updates: `forecast_data` (Prophet), `risk_data` (Value-at-Risk, Sharpe, maximum drawdown), `analyst_data`.
-* **MONTHLY Update**:
-  - Updates: `ownership_data`, `peer_comparison_data`.
-* **QUARTERLY / EVENT Update**:
-  - Updates: `fundamental_data`, `dividend_data`, `insider_transactions`.
-* **NEW STOCKS (Full Load, 30–60 seconds)**:
-  - Automatically detects if a stock symbol does not exist in the database and performs a full 10-year historical load of all tables.
-
----
-
-## Execution Guide
-
-### 1. Test Database Connectivity
-You can test your connection to Azure Postgres or Supabase using:
 ```bash
-python database/export_to_azure_postgres.py --test-connection
+scripts/sync_from_tickzen.sh --check     # list files that differ
+scripts/sync_from_tickzen.sh             # copy them
 ```
 
-### 2. Run Single Stock Sync
-To sync/update a single ticker (e.g. Apple):
-```bash
-python database/export_to_azure_postgres.py AAPL
-```
+The scheduling rules are shared too, so the workers, the Mac runner and the admin dashboard always agree:
+`database/updater_schedule.py` (export window, what counts as current, worker parts), `database/updater_locks.py`
+(per-stock claims) and `database/updater_run_log.py` (the run log behind the dashboard).
 
-### 3. Run Automated Cron/Batch Updates
-To run the automated scheduler runner:
-```bash
-python database/cron_update_runner.py --limit 70
-```
-* **Note**: The cron runner is designed to skip runs during active market hours to prevent rate limit conflicts. You can force execution at any time by adding the `--force` flag:
-```bash
-python database/cron_update_runner.py --limit 70 --force
-```
+## Dashboard
 
----
+TickZen admin panel -> **Database Updater** (`/admin/db-updater`): tonight's progress and estimated finish, each
+worker's state, region, IP, Yahoo requests per stock and 429s, stocks that need attention with the error, data
+freshness per dataset, 30 nights of history, and the stock list where stocks are added, paused or removed.
 
-## Database Ticker List Setup (Option A)
+Exporter-only files (never overwritten by the sync):
 
-Instead of editing local JSON files, the exporter queries the database table `monitored_tickers` for active tickers. 
+| File | Why it differs |
+| :--- | :--- |
+| `database/cron_update_runner.py` | Same per-stock export; scheduling for many workers: stock list from `monitored_tickers`, US-market window, parts per worker, per-stock claims, Azure-only |
+| `database/yahoo_pacer.py` | Spaces every Yahoo request of a worker evenly; backs off on HTTP 429; counts requests |
+| `app/html_components.py` | Only `get_currency_symbol` (identical) - the real file is the Flask UI |
+| `Dockerfile`, `.dockerignore`, `requirements.txt` | Container build; package versions pinned to tickzen-github's `.venv` |
+| `deploy/azure/` | Azure Container Apps deployment, one job per worker |
+| `database/generate_dashboard.py`, `database/create_monitored_tickers.py`, `dashboard.html` | Legacy Render-era tools, not used by the runner |
 
-### 1. Create the `monitored_tickers` Table
-Run this SQL query on your database:
+## How it works
+
+* **Stock list:** every active row of `monitored_tickers`, read fresh on every run. Add a stock there and the
+  next run does its full first load.
+* **When:** only while the US market is closed: trading days 16:30-09:00 New York time (30 min after the close to
+  30 min before the open; `EXPORT_START_ET` / `EXPORT_STOP_ET`), weekends and NYSE holidays all day. Daylight saving is automatic.
+* **What is stale:** a stock is current when its last *successful* sync is after the latest trading-day 16:30 ET.
+  So each stock is exported once per trading session; weekends find everything current; partial/failed stocks
+  stay stale and are retried.
+* **Parts:** with `WORKER_COUNT` workers the list is split into equal parts (stocks ordered by md5 of the symbol
+  and dealt out in turn, so every worker computes the same split). Worker `WORKER_INDEX` exports its own part
+  first, oldest first; new stocks go to the front.
+* **Failover:** when a worker has finished its part it helps with stale stocks of the other parts. Each stock
+  is claimed (Postgres advisory lock) only right before it is exported, so an idle worker can take any stock
+  another worker has not reached yet, and two workers never export the same stock at once. If one region's IP
+  is blocked, the others finish its part.
+* **Hourly batches:** each worker's job starts every hour at :30. A run exports at most `STOCKS_PER_RUN` (70)
+  stocks and stops starting new ones after `RUN_TIME_BUDGET_MINUTES` (55), then waits for the next hour. It exits
+  at once if the market is open, nothing is stale, or the worker is already running.
+* **Rate limit:** inside a run every request to Yahoo goes through `database/yahoo_pacer.py`: at most
+  `YAHOO_REQUESTS_PER_HOUR` (default 1,200 = one every 3 s, so never more than 20 in a minute), evenly spaced.
+  A real HTTP 429 pauses the worker 60 s and halves its pace until the run ends (the next hourly run starts at
+  full pace again); `STOP_AFTER_429` (3) of them end the run. The connectivity check deliberately does not call
+  Yahoo: a plain request to Yahoo is answered with 429, which on 2026-10-15 halved both workers' pace all night.
+* **Earnings step** (recent-reporter history) runs once per run on whichever worker gets to it first, after that
+  worker's own part is done.
+* **Implied moves** run in their own job, `tickzen-implied-moves` (`database/implied_moves_job.py`,
+  `deploy/azure/deploy_implied_moves_job.sh`), at 15:15, 17:15 and 19:15 UTC on weekdays, because they need live
+  option quotes: after the close Yahoo returns bid = ask = open interest = 0 on every contract, which is why the
+  nightly runs stored NULL for 224 of 232 reports. The job exits at once outside 09:45-15:45 New York on trading
+  days, only reads option chains (2 paced requests per report in the next 10 days) and only writes
+  `earnings_calendar.implied_move_*`.
+
+### Adding stocks
+
+Use **Manage stocks** on the dashboard. The SQL equivalent:
+
 ```sql
-CREATE TABLE IF NOT EXISTS monitored_tickers (
-    symbol VARCHAR(10) PRIMARY KEY,
-    is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+INSERT INTO monitored_tickers (symbol, is_active) VALUES ('ABCD', true), ('EFGH', true)
+ON CONFLICT (symbol) DO UPDATE SET is_active = true, updated_at = now();
 ```
 
-### 2. Seed/Insert Tickers
-Insert the stock symbols you want the exporter to sync:
-```sql
-INSERT INTO monitored_tickers (symbol, is_active)
-VALUES 
-('AAPL', true),
-('MSFT', true),
-('NVDA', true),
-('TSLA', true)
-ON CONFLICT (symbol) DO UPDATE 
-SET is_active = true;
-```
+To stop updating a stock: `UPDATE monitored_tickers SET is_active = false WHERE symbol = 'ABCD';`
 
-If the `monitored_tickers` table does not exist or is empty, the exporter will automatically fall back to reading symbols from `database/stock_tickers_list.json`.
+## Capacity
 
-## Cloud Automation (Deployment & Scheduling)
+Measured Yahoo requests per stock (MSFT, data collection, 2026-10-15): **38 with an empty cache, 6 with this
+month's cache**. Adding the export's own calls (TTM cash flow, earnings history, analyst detail, live price),
+plan with **~15 per stock on a normal night and ~45 when the cache is cold** (first export of each calendar
+month, or a worker without its cache share).
 
-You can deploy and automate this sync system in two ways: using **GitHub Actions (Recommended & Free)** or **Render Services**.
+| | Per worker per weekday night |
+| :--- | :--- |
+| Window | 16.5 h |
+| Yahoo budget at 1,200/h | 19,800 requests |
+| Stocks, cached (~15 each) | ~1,300 |
+| Stocks, cold (~45 each) | ~440 |
 
----
+For 4,000 stocks:
 
-### Option A: GitHub Actions (Recommended & Free)
-Using GitHub Actions, you can run the 5 instances in parallel directly inside GitHub's infrastructure. It is completely free for public repositories and private repositories (up to monthly limits, extended by the GitHub Student Developer Pack).
+* Normal night: 4,000 x 15 = 60,000 requests -> 3.1 workers' budget.
+* First night of a month (the profile/financials/peer caches are keyed by calendar month, so all of them
+  expire together): 4,000 x 45 = 180,000 requests -> 9.1 workers' budget. Prophet forecasts also retrain monthly
+  (~15 s CPU per stock) on that night.
 
-#### How to Set Up:
-1. **Push this repository to GitHub**.
-2. **Add Secrets**: In your GitHub Repository, navigate to **Settings > Secrets and variables > Actions** and click **New repository secret** to add:
-   - `AZURE_POSTGRES_URL` = `postgresql://Jadaunkg:<password>@<host>:5432/<database>?sslmode=require`
-   - `FRED_API_KEY` = `your_fred_key` (Shared key)
-   - `FINNHUB_API_KEY_0` = `first_finnhub_key` (Used by Instance 0)
-   - `FINNHUB_API_KEY_1` = `second_finnhub_key` (Used by Instance 1)
-   - `FINNHUB_API_KEY_2` = `third_finnhub_key` (Used by Instance 2)
-   - `FINNHUB_API_KEY_3` = `fourth_finnhub_key` (Used by Instance 3)
-   - `FINNHUB_API_KEY_4` = `fifth_finnhub_key` (Used by Instance 4)
-3. **Execution**:
-   - **Automatic**: The workflow file `.github/workflows/daily_sync.yml` is configured to run automatically everyday at 21:00 UTC (2:30 AM IST).
-   - **Manual**: Go to the **Actions** tab in your repository, select **Daily Stock Data Sync**, and click **Run workflow**.
+## Deploy to Azure
 
-This spins up 5 parallel runners, each working on its alphabetical slice of tickers with sub-batch throttling (70 stocks at a time, sleeping 70 minutes between batches), completing the sync overnight.
-
----
-
-### Option B: Render Service Setup
-If you prefer to deploy on Render, create **5 Background Workers** (or Web Services) pointing to this GitHub repository.
-
-#### Method 1: Partitioning via Instance Index
-You configure each Render service with the same start command:
 ```bash
-python database/cron_update_runner.py --force
+brew install azure-cli && az login && az extension add -n containerapp
+export AZURE_POSTGRES_PASSWORD=... FINNHUB_API_KEY=... FRED_API_KEY=...
+WORKER_INDEX=0 WORKER_COUNT=6 LOCATION=centralindia deploy/azure/deploy_container_apps_job.sh
+WORKER_INDEX=1 WORKER_COUNT=6 LOCATION=southindia   SKIP_BUILD=1 deploy/azure/deploy_container_apps_job.sh
+# ... one call per worker, each in a different region
 ```
-Then, you set a different `INSTANCE_INDEX` environment variable on each Render service:
 
-| Service Name | Environment Variables | Target Tickers |
-| :--- | :--- | :--- |
-| **Instance 1** | `INSTANCE_INDEX=0`, `TOTAL_INSTANCES=5` | First 20% of tickers sorted alphabetically |
-| **Instance 2** | `INSTANCE_INDEX=1`, `TOTAL_INSTANCES=5` | Second 20% of tickers sorted alphabetically |
-| **Instance 3** | `INSTANCE_INDEX=2`, `TOTAL_INSTANCES=5` | Third 20% of tickers sorted alphabetically |
-| **Instance 4** | `INSTANCE_INDEX=3`, `TOTAL_INSTANCES=5` | Fourth 20% of tickers sorted alphabetically |
-| **Instance 5** | `INSTANCE_INDEX=4`, `TOTAL_INSTANCES=5` | Fifth 20% of tickers sorted alphabetically |
+Each call creates (or updates) one worker: a Container Apps environment in that region (its own outbound IP), a
+file share for its cache, and the job `tickzen-db-updater-<index>` (hourly at :30). The registry and image are shared;
+`SKIP_BUILD=1` reuses the last image. `WORKER_COUNT` must be the same everywhere: when you add workers, redeploy
+all of them with the new count (`SKIP_BUILD=1`). The script also warns if the Postgres firewall does not admit
+Azure services.
 
-#### Method 2: Direct Limits and Offsets
-Alternatively, configure unique start commands for each service (using either CLI flags or environment variables):
+After the Azure workers have completed a night, stop the Mac job so both do not compete:
 
-| Instance ID | Start Command | Target Tickers | Description |
-| :--- | :--- | :--- | :--- |
-| **Instance 1** | `python database/cron_update_runner.py --limit 400 --offset 0` | Tickers 1 - 400 | First batch of stocks |
-| **Instance 2** | `python database/cron_update_runner.py --limit 400 --offset 400` | Tickers 401 - 800 | Second batch of stocks |
-| **Instance 3** | `python database/cron_update_runner.py --limit 400 --offset 800` | Tickers 801 - 1200 | Third batch of stocks |
-| **Instance 4** | `python database/cron_update_runner.py --limit 400 --offset 1200` | Tickers 1201 - 1600 | Fourth batch of stocks |
-| **Instance 5** | `python database/cron_update_runner.py --limit 400 --offset 1600` | Tickers 1601 - End | Fifth batch of stocks |
+```bash
+launchctl unload ~/Library/LaunchAgents/com.tickzen.dbupdater.plist
+```
 
-#### Environment Variables for Render
-Make sure to define these variables in the Render dashboard for each service:
-- `DB_TYPE`: `azure`
-- `AZURE_POSTGRES_URL`: `postgresql://Jadaunkg:<password>@<host>:5432/<database>?sslmode=require`
-- `FINNHUB_API_KEY`: `<your key>`
-- `FRED_API_KEY`: `<your key>`
-- `SUB_BATCH_SIZE`: `70`
-- `BATCH_SLEEP_SECONDS`: `4200`
-- `PYTHONUNBUFFERED`: `1`
+## Run locally
 
+```bash
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # fill in the Azure password and API keys
+python database/cron_update_runner.py --preview --force    # show this worker's queue
+```
 
+`.github/workflows/daily_sync.yml` is a manual-only fallback that runs one batch from a GitHub runner.

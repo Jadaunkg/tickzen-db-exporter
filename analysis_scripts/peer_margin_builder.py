@@ -29,25 +29,15 @@ import numpy as np
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-CACHE_DIR = '/Users/jadaunkg/Desktop/tickzen-github/analysis_scripts/.dcf_cache'
+CACHE_DIR = os.environ.get('TICKZEN_DCF_CACHE_DIR', os.path.join(os.environ.get('TMPDIR', '/tmp'), 'tickzen-dcf-cache'))
 CACHE_DB = os.path.join(CACHE_DIR, 'peer_margins.db')
 CACHE_TTL_DAYS = 7  # Refresh peer data weekly
 MAX_PEERS_TO_QUERY = 50  # Prevent runaway queries
 MIN_PEERS_FOR_TIER1 = 4  # Need ≥4 peers for Tier 1
 MIN_PEERS_FOR_TIER2 = 2  # Need ≥2 peers for Tier 2
 
-# Ensure cache directory exists before setting up logging
-os.makedirs(CACHE_DIR, exist_ok=True)
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(os.path.join(CACHE_DIR, 'peer_margin_builder.log')),
-        logging.StreamHandler()
-    ]
-)
+# This is a library module: importing it must not create files or reconfigure
+# the application's root logger. Cache setup remains lazy in _init_cache_db().
 logger = logging.getLogger(__name__)
 
 # ============================================================================

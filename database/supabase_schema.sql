@@ -299,6 +299,12 @@ CREATE TABLE IF NOT EXISTS insider_transactions (
     shares_change BIGINT,
     transaction_price NUMERIC(16, 4),
     estimated_value NUMERIC(20, 2),
+    transaction_code VARCHAR(8),
+    transaction_type VARCHAR(24),
+    is_economic_transaction BOOLEAN NOT NULL DEFAULT TRUE,
+    ownership_type VARCHAR(24),
+    ownership_after NUMERIC(20, 4),
+    ownership_change NUMERIC(20, 4),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (stock_id) REFERENCES stocks(id) ON DELETE CASCADE

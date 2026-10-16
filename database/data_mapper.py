@@ -24,9 +24,24 @@ Tables Supported:
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, date
+import re
+from datetime import datetime, date, timezone
 from typing import Dict, List, Any, Optional, Tuple
 import logging
+
+from database.financial_contract import (
+    SCHEMA_VERSION,
+    PartialProviderData,
+    is_partial_provider_info,
+    latest_statement_period,
+    next_earnings_date as upcoming_earnings_date,
+    normalized_exchange,
+    provider_fraction,
+    reconcile_fundamental_margins,
+    rescale_market_size,
+    stable_content_hash,
+    ttm_cash_flow_from_statement,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +143,13 @@ class DataMapper:
                 'industry': info.get('industry'),
                 'country': info.get('country'),
                 'exchange': info.get('exchange'),
+                'normalized_exchange': normalized_exchange(info.get('exchange')),
+                'quote_currency': (info.get('currency') or '').upper() or None,
+                'financial_currency': (
+                    info.get('financialCurrency') or info.get('currency') or ''
+                ).upper() or None,
+                'security_type': info.get('quoteType'),
+                'schema_version': SCHEMA_VERSION,
                 'website_url': info.get('website'),
                 'employee_count': info.get('fullTimeEmployees'),
                 'headquarters': self._extract_headquarters(info),
@@ -327,7 +349,13 @@ class DataMapper:
             logger.error(f"Error mapping technical indicators: {e}")
             raise
     
-    def map_forecast_data(self, stock_id: int, forecast_df: pd.DataFrame, info: Dict) -> List[Dict]:
+    def map_forecast_data(
+        self,
+        stock_id: int,
+        forecast_df: pd.DataFrame,
+        info: Dict,
+        forecast_metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict]:
         """
         Map forecast data to forecast_data table
         
@@ -335,6 +363,9 @@ class DataMapper:
             stock_id: Stock ID from stocks table
             forecast_df: Prophet forecast DataFrame (aggregated format with Period, Low, Average, High)
             info: yfinance info dict (not used - analyst data moved to separate table)
+            forecast_metadata: Provenance emitted only when the model was trained
+                in the current collection run. Cached forecasts must not inherit
+                unverified training metadata.
             
         Returns:
             List of dicts ready for forecast_data table (12 monthly records)
@@ -345,43 +376,103 @@ class DataMapper:
             if forecast_df is None or forecast_df.empty:
                 return records
             
-            # The forecast_df from pipeline has columns: Period, Low, Average, High
-            # Create one record per month (skip first row if it's current month, take next 12)
-            forecast_date = datetime.now().strftime('%Y-%m-%d')
-            
-            # Take up to 12 months of forecast (excluding current month which is row 0)
-            forecast_months = forecast_df.iloc[1:13] if len(forecast_df) > 1 else forecast_df
-            
+            # The forecast_df from pipeline has columns: Period, Low, Average, High.
+            stored_at = datetime.now().astimezone()
+            metadata = forecast_metadata or {}
+            generated_at = metadata.get('generated_at')
+            # forecast_date is the legacy storage-batch key. It must not be
+            # confused with model generation time when serving cached output.
+            forecast_date = str(generated_at)[:10] if generated_at else stored_at.date().isoformat()
+            anchor_date = pd.to_datetime(metadata.get('anchor_as_of'), errors='coerce')
+            has_model_anchor = not pd.isna(anchor_date)
+            if not has_model_anchor:
+                anchor_date = pd.Timestamp(stored_at.date())
+
+            # The model forecasts business days up to anchor + 1 year, so its last monthly bucket is usually a few
+            # sessions of a month (ALNY: one session, 2027-10-01). Dating that bucket at its month-end would claim a
+            # horizon (395 days) the numbers do not reach (365 days) and show a near-duplicate of the previous row.
+            # Each row is therefore dated no later than the last forecast session.
+            horizon_end = pd.to_datetime(metadata.get('horizon_end'), errors='coerce')
+            if pd.isna(horizon_end) and has_model_anchor:
+                horizon_end = anchor_date + pd.DateOffset(years=1)
+            if not pd.isna(horizon_end):
+                horizon_end = pd.bdate_range(end=horizon_end.normalize(), periods=1)[0]
+
+            # Keep only future buckets. Skip malformed dates rather than
+            # silently substituting an approximate 30-day horizon.
             seen_periods = set()
-            for i, (_, row) in enumerate(forecast_months.iterrows()):
-                # Calculate forecast period in days from now
-                try:
-                    period_date = pd.to_datetime(row['Period'], format='%Y-%m')
-                    days_ahead = (period_date - pd.Timestamp(datetime.now())).days
-                except:
-                    days_ahead = (i + 1) * 30  # Approximate
-                
-                # Ensure forecast_period is unique and positive
-                period = max(30, days_ahead)
-                while period in seen_periods:
-                    period += 30
+            for _, row in forecast_df.iterrows():
+                period_label = str(row.get('Period', '')).strip()
+                if re.fullmatch(r'\d{4}-\d{2}', period_label):
+                    period_date = pd.to_datetime(period_label, format='%Y-%m', errors='coerce')
+                    period_end = period_date + pd.offsets.MonthEnd(0) if not pd.isna(period_date) else pd.NaT
+                else:
+                    period_end = pd.to_datetime(period_label, errors='coerce')
+                    period_date = period_end
+                if pd.isna(period_date) or pd.isna(period_end):
+                    logger.warning("Skipping forecast row with invalid period: %r", period_label)
+                    continue
+                if not pd.isna(horizon_end) and period_end > horizon_end >= period_date:
+                    period_end = horizon_end
+
+                anchor_month = pd.Timestamp(year=anchor_date.year, month=anchor_date.month, day=1)
+                if period_date <= anchor_month:
+                    continue
+
+                period = int((period_end.normalize() - anchor_date.normalize()).days)
+                if period <= 0 or period in seen_periods:
+                    logger.warning("Skipping forecast row with invalid/duplicate horizon: %r", period_label)
+                    continue
+                forecast_period_end = period_end.strftime('%Y-%m-%d')
                 seen_periods.add(period)
+
+                low_price = safe_float_conversion(row.get('Low'))
+                base_price = safe_float_conversion(row.get('Average'))
+                high_price = safe_float_conversion(row.get('High'))
+                if (
+                    low_price is None or base_price is None or high_price is None
+                    or low_price <= 0 or low_price > base_price or base_price > high_price
+                ):
+                    logger.warning("Skipping forecast row with invalid price band for %s", period_label)
+                    continue
                 
                 record = {
                     'stock_id': stock_id,
-                    'forecast_date': forecast_date,  # When forecast was generated
-                    'forecast_period': period,  # Days ahead (unique)
+                    'forecast_date': forecast_date,  # Legacy generation-date/storage-batch key
+                    'forecast_period': period,
+                    'horizon_basis': 'model_anchor' if has_model_anchor else 'refresh_date_training_origin_unknown',
                     
                     # Prophet Forecast Prices for this month (varies by month).
                     # forecast_price_1y stores the Prophet upper-band (High) for the
                     # nearest monthly period — it is NOT a discrete 1-year price target.
                     # The query layer exposes this as forecast_price_high.
-                    'forecast_price_1y': float(row['High']) if pd.notna(row['High']) else None,
-                    'forecast_avg_price': float(row['Average']) if pd.notna(row['Average']) else None,
-                    'forecast_range_width': float(row['High'] - row['Low']) if pd.notna(row['High']) and pd.notna(row['Low']) else None,
+                    'forecast_price_1y': high_price,
+                    'forecast_avg_price': base_price,
+                    'forecast_range_width': high_price - low_price,
+                    # Explicit v1 contract fields. Legacy fields remain populated
+                    # during the rolling migration so the previous reader works.
+                    'period_end': forecast_period_end,
+                    'low_price': low_price,
+                    'base_price': base_price,
+                    'high_price': high_price,
+                    # This is a Prophet pipeline version, not the unrelated
+                    # financial calculation-contract version.
+                    'model_version': metadata.get('model_version'),
+                    'generated_at': generated_at,
+                    'model_name': metadata.get('model_name'),
+                    'source_class': metadata.get('source_class'),
+                    'training_start_date': metadata.get('training_start_date'),
+                    'training_cutoff_date': metadata.get('training_cutoff_date'),
+                    'input_series': metadata.get('input_series'),
+                    'adjustment_policy': metadata.get('adjustment_policy'),
+                    'band_definition': metadata.get('band_definition'),
+                    'anchor_price': metadata.get('anchor_price'),
+                    'anchor_as_of': metadata.get('anchor_as_of'),
                 }
                 
                 records.append(record)
+                if len(records) >= 12:
+                    break
             
             logger.info(f"Created {len(records)} monthly forecast records")
             return records
@@ -411,25 +502,10 @@ class DataMapper:
             analyst_rating = info.get('recommendationKey')
             analyst_count = int(info.get('numberOfAnalystOpinions')) if info.get('numberOfAnalystOpinions') else None
             
-            # Get earnings date (convert to US Eastern Time for correct date)
-            next_earnings_date = None
-            if 'earningsTimestamp' in info and info['earningsTimestamp']:
-                try:
-                    from datetime import datetime as dt
-                    import pytz
-                    # Convert timestamp to US Eastern Time
-                    utc_time = dt.utcfromtimestamp(info['earningsTimestamp']).replace(tzinfo=pytz.UTC)
-                    eastern = pytz.timezone('US/Eastern')
-                    eastern_time = utc_time.astimezone(eastern)
-                    next_earnings_date = eastern_time.strftime('%Y-%m-%d')
-                except:
-                    # Fallback to simple conversion if pytz not available
-                    try:
-                        from datetime import datetime as dt
-                        next_earnings_date = dt.fromtimestamp(info['earningsTimestamp']).strftime('%Y-%m-%d')
-                    except:
-                        pass
-            
+            # Only an earnings date that is still in the future is "next earnings" (US/Eastern).
+            # A past or missing date is stored as NULL - never as a stale date presented as upcoming.
+            next_earnings_date = upcoming_earnings_date(info)
+
             record = {
                 'stock_id': stock_id,
                 'target_price_mean': target_price_mean,
@@ -447,20 +523,28 @@ class DataMapper:
             logger.error(f"Error mapping analyst data: {e}")
             raise
     
-    def map_fundamental_data(self, stock_id: int, info: Dict, balance_sheet: pd.DataFrame = None, financials: pd.DataFrame = None, ticker: str = None) -> Dict:
+    def map_fundamental_data(self, stock_id: int, info: Dict, balance_sheet: pd.DataFrame = None, financials: pd.DataFrame = None, ticker: str = None, ttm_cashflow: pd.DataFrame = None) -> Dict:
         """
         Map fundamental metrics to fundamental_data table
-        
+
         Args:
             stock_id: Stock ID from stocks table
             info: yfinance info dict
             balance_sheet: Balance sheet DataFrame from yfinance
             financials: Income statement DataFrame from yfinance
             ticker: Stock symbol
-            
+            ttm_cashflow: yfinance trailing-twelve-month cash-flow statement (source of FCF; see
+                ttm_cash_flow_from_statement). Without it free cash flow is left empty, never taken from
+                Yahoo's differently-defined ``freeCashflow`` field.
+
         Returns:
             Dict ready for fundamental_data table
+
+        Raises:
+            PartialProviderData: ``info`` is a stub payload; nothing must be written for this stock.
         """
+        if is_partial_provider_info(info):
+            raise PartialProviderData(f"Yahoo returned a partial info payload for {ticker or 'unknown ticker'}")
         try:
             from data_processing_scripts.data_collection import get_current_market_price
             
@@ -485,14 +569,20 @@ class DataMapper:
             
             pe_ratio = safe_float_conversion(current_price / eps_diluted) if current_price and eps_diluted and eps_diluted != 0 else safe_float_conversion(info.get('trailingPE'))
             
-            # Shares outstanding and market cap
+            # Shares outstanding and market cap. price x sharesOutstanding is wrong for multi-class and ADR
+            # listings (GOOGL: 5.87B class-A shares -> a market cap half the real one, so P/S printed 5.1x for a
+            # real 10.1x), so the vendor market cap is used and only rescaled to the live price.
             shares_outstanding = safe_float_conversion(info.get('sharesOutstanding'))
+            vendor_market_cap = safe_float_conversion(info.get('marketCap'))
+            vendor_price = safe_float_conversion(info.get('currentPrice') or info.get('regularMarketPrice'))
             market_cap = None
-            if current_price and shares_outstanding:
+            if vendor_market_cap and current_price and vendor_price:
+                market_cap = vendor_market_cap * current_price / vendor_price
+            elif vendor_market_cap:
+                market_cap = vendor_market_cap
+            elif current_price and shares_outstanding:
                 market_cap = current_price * shares_outstanding
-            else:
-                market_cap = safe_float_conversion(info.get('marketCap'))
-                
+
             # Price to Sales
             revenue_ttm = safe_float_conversion(info.get('totalRevenue'))
             price_to_sales = safe_float_conversion(market_cap / revenue_ttm) if market_cap and revenue_ttm and revenue_ttm > 0 else safe_float_conversion(info.get('priceToSalesTrailing12Months'))
@@ -510,15 +600,26 @@ class DataMapper:
                 else:
                     price_to_book = safe_float_conversion(info.get('priceToBook'))
             
+            # Cash flow: OCF and FCF come from the same cash-flow statement so FCF can never exceed OCF.
+            operating_cash_flow = safe_float_conversion(info.get('operatingCashflow'))
+            free_cash_flow = None
+            statement_cash_flow = ttm_cash_flow_from_statement(ttm_cashflow)
+            if statement_cash_flow['operating_cash_flow'] is not None:
+                operating_cash_flow = safe_float_conversion(statement_cash_flow['operating_cash_flow'])
+                free_cash_flow = safe_float_conversion(statement_cash_flow['free_cash_flow'])
+            elif statement_cash_flow['free_cash_flow'] is not None:
+                free_cash_flow = safe_float_conversion(statement_cash_flow['free_cash_flow'])
+
             # Price to Free Cash Flow
-            free_cash_flow = safe_float_conversion(info.get('freeCashflow'))
             price_to_fcf = safe_float_conversion(market_cap / free_cash_flow) if market_cap and free_cash_flow and free_cash_flow > 0 else None
             
             # Enterprise Value
-            total_debt = safe_float_conversion(info.get('totalDebt')) or 0
-            total_cash = safe_float_conversion(info.get('totalCash')) or 0
+            total_debt = safe_float_conversion(info.get('totalDebt'))
+            total_cash = safe_float_conversion(info.get('totalCash'))
             enterprise_value = None
-            if market_cap:
+            # Enterprise value is only derivable when both balance-sheet
+            # adjustments are known. Missing debt/cash is not equivalent to 0.
+            if market_cap and total_debt is not None and total_cash is not None:
                 enterprise_value = market_cap + total_debt - total_cash
             else:
                 enterprise_value = safe_float_conversion(info.get('enterpriseValue'))
@@ -530,10 +631,30 @@ class DataMapper:
             ebitda_ttm = safe_float_conversion(info.get('ebitda'))
             ev_to_ebitda = safe_float_conversion(enterprise_value / ebitda_ttm) if enterprise_value and ebitda_ttm and ebitda_ttm > 0 else safe_float_conversion(info.get('enterpriseToEbitda'))
             
+            retrieved_at = datetime.now().astimezone().isoformat()
+            source_period = latest_statement_period(balance_sheet, financials)
+            if not source_period and info.get('mostRecentQuarter'):
+                try:
+                    source_period = datetime.utcfromtimestamp(
+                        int(info['mostRecentQuarter'])
+                    ).date().isoformat()
+                except (TypeError, ValueError, OverflowError, OSError):
+                    source_period = None
+            # The existing key requires a period. Refuse publication instead of
+            # fabricating today's date as the financial statement period.
+            if not source_period:
+                raise ValueError("Missing source financial statement period for TTM data")
+            period_date = source_period
+
             record = {
                 'stock_id': stock_id,
-                'period_date': datetime.now().strftime('%Y-%m-%d'),
+                'period_date': period_date,
                 'period_type': 'TTM',  # Trailing Twelve Months
+                'retrieved_at': retrieved_at,
+                'source': 'yfinance',
+                'statement_currency': (
+                    info.get('financialCurrency') or info.get('currency') or ''
+                ).upper() or None,
                 
                 # Valuation
                 'pe_ratio': pe_ratio,
@@ -558,8 +679,8 @@ class DataMapper:
                 'debt_to_equity': safe_float_conversion(info.get('debtToEquity')),
                 'total_cash': safe_float_conversion(info.get('totalCash')),
                 'total_debt': safe_float_conversion(info.get('totalDebt')),
-                'free_cash_flow': safe_float_conversion(info.get('freeCashflow')),
-                'operating_cash_flow': safe_float_conversion(info.get('operatingCashflow')),
+                'free_cash_flow': free_cash_flow,
+                'operating_cash_flow': operating_cash_flow,
                 'current_ratio': safe_float_conversion(info.get('currentRatio')),
                 'quick_ratio': safe_float_conversion(info.get('quickRatio')),
                 
@@ -572,8 +693,15 @@ class DataMapper:
                 'gross_profit_ttm': safe_float_conversion(info.get('grossProfits')),
             }
             
+            # Providers return an exact 0 for margins they cannot compute: never publish that as a real 0 %.
+            reconcile_fundamental_margins(record)
+
             # Calculate efficiency metrics from financial statements
             self._add_efficiency_metrics(record, info, balance_sheet, financials)
+            record['content_hash'] = stable_content_hash(
+                record,
+                ignored=('retrieved_at', 'content_hash'),
+            )
             
             return record
             
@@ -640,9 +768,16 @@ class DataMapper:
                     'eps_basic': safe_float_conversion(data.get('Basic EPS_raw')) if data.get('Basic EPS_raw') else (safe_float_conversion(data.get('Basic EPS')) if data.get('Basic EPS') and isinstance(data.get('Basic EPS'), (int, float)) else None),
                     
                     # Calculated Margins
-                    'gross_margin': safe_float_conversion(data.get('Gross Margin_raw')),
+                    'gross_margin': None,
                 }
-                
+
+                # 'Gross Margin_raw' is in percent points (74.6); fundamental_data.gross_margin is a FRACTION
+                # (0.746) per column_units.json, exactly like the net/operating margins below. Storing the raw
+                # value made the site print 7457% for every quarter.
+                gross_margin_pp = safe_float_conversion(data.get('Gross Margin_raw'))
+                if gross_margin_pp is not None:
+                    record['gross_margin'] = safe_float_conversion(gross_margin_pp / 100.0)
+
                 # Calculate Net Margin if possible
                 if record['net_income_ttm'] is not None and record['revenue_ttm'] is not None and record['revenue_ttm'] != 0:
                     record['net_margin'] = safe_float_conversion(record['net_income_ttm'] / record['revenue_ttm'])
@@ -731,8 +866,16 @@ class DataMapper:
                     'stock_id': stock_id,
                     'peer_ticker': peer_symbol,
                     'is_target': peer_symbol == target_ticker.upper(),
+                    'quote_currency': (
+                        metrics.get('quote_currency')
+                        or (peer_quote or {}).get('currency')
+                    ),
+                    'exchange': metrics.get('exchange'),
+                    'country': metrics.get('country'),
                     'market_cap': safe_float_conversion(peer_market_cap),
                     'pe_ratio': safe_float_conversion(peer_pe_ratio),
+                    # Contract: provider revenue growth, net margin, and ROE
+                    # are decimal fractions; peer dividend_yield is percentage points.
                     'revenue_growth': to_float(metrics.get('Revenue Growth')),
                     'net_margin': to_float(metrics.get('Net Margin')),
                     'eps': to_float(metrics.get('EPS')),
@@ -1109,7 +1252,8 @@ class DataMapper:
                     real_price = None
 
             # Final published price (real-time if available, else today's close)
-            published_price = real_price if real_price is not None else (current_close if current_close is not None else 0.0)
+            # Missing quotes remain unknown; never publish a fabricated zero.
+            published_price = real_price if real_price is not None else current_close
 
             # Compute price change relative to PREVIOUS day's close (not comparing to itself!)
             # Percentage change formula: (current - previous) / previous * 100
@@ -1240,12 +1384,21 @@ class DataMapper:
                 elif change_pct_val <= -0.5:
                     price_alert_flags['moderate_loss'] = True
 
+            live_market_cap, live_enterprise_value = rescale_market_size(
+                info.get('marketCap'),
+                info.get('enterpriseValue'),
+                info.get('currentPrice') or info.get('regularMarketPrice'),
+                published_price,
+                total_debt=info.get('totalDebt'),
+                total_cash=info.get('totalCash'),
+            )
+
             record = {
                 'stock_id': stock_id,
                 'date': datetime.now().strftime('%Y-%m-%d'),
 
                 # Current Price & Changes (published_price is real-time when available)
-                'current_price': float(published_price),
+                'current_price': safe_float_conversion(published_price),
                 'price_change': float(price_change_val) if price_change_val is not None else None,
                 'change_pct': cap_percentage(change_pct_val),
 
@@ -1270,9 +1423,10 @@ class DataMapper:
                 'momentum_score': safe_float_conversion(momentum_score) if momentum_score is not None else None,
                 'price_alert_flags': sanitize_for_json(price_alert_flags),
 
-                # Market Size
-                'market_cap': float(info.get('marketCap')) if info.get('marketCap') else None,
-                'enterprise_value': float(info.get('enterpriseValue')) if info.get('enterpriseValue') else None,
+                # Market Size (rescaled to the published price: ``info`` comes from a monthly profile cache, so its
+                # marketCap/enterpriseValue are as old as that cache - AVGO printed one market cap on 23 and 26 Sep)
+                'market_cap': live_market_cap,
+                'enterprise_value': live_enterprise_value,
                 'shares_outstanding': float(info.get('sharesOutstanding')) if info.get('sharesOutstanding') else None,
                 # Fix float_shares validation - float MUST be <= outstanding
                 'float_shares': (
@@ -1297,13 +1451,14 @@ class DataMapper:
         Format dividend yield data with proper validation and correction.
         
         Args:
-            raw_yield: Raw yield value from yfinance (may be decimal or percentage)
-            is_percentage_point: If True, explicitly scale down percentage points (e.g. 0.34 -> 0.0034)
+            raw_yield: Raw yield value from a field with a known unit
+            is_percentage_point: If True, scale down percentage points (e.g. 0.34 -> 0.0034);
+                otherwise preserve a declared decimal fraction.
             
         Returns:
             Properly formatted yield as decimal (0.0259 for 2.59%)
         """
-        if raw_yield is None or raw_yield == 0:
+        if raw_yield is None:
             return None
             
         # Convert to float and handle edge cases
@@ -1314,9 +1469,6 @@ class DataMapper:
             
         # If explicitly marked as percentage point, scale it down.
         if is_percentage_point:
-            corrected_yield = yield_value / 100.0
-        # If raw value is > 1, assume it's already a percentage and convert to decimal
-        elif yield_value > 1:
             corrected_yield = yield_value / 100.0
         else:
             corrected_yield = yield_value
@@ -1436,7 +1588,7 @@ class DataMapper:
             
             # Recalculate yield fields if current price and rates are available
             dividend_rate = safe_float_conversion(info.get('dividendRate'))
-            if current_price and dividend_rate and current_price > 0:
+            if current_price is not None and current_price > 0 and dividend_rate is not None:
                 dividend_yield_pct = self._format_dividend_yield(dividend_rate / current_price, is_percentage_point=False)
                 dividend_forward_yield = dividend_yield_pct
             else:
@@ -1444,10 +1596,12 @@ class DataMapper:
                 dividend_forward_yield = self._format_dividend_yield(info.get('dividendYield'), is_percentage_point=True)
                 
             dividend_trailing_rate = safe_float_conversion(info.get('trailingAnnualDividendRate'))
-            if current_price and dividend_trailing_rate and current_price > 0:
+            if current_price is not None and current_price > 0 and dividend_trailing_rate is not None:
                 dividend_trailing_yield = self._format_dividend_yield(dividend_trailing_rate / current_price, is_percentage_point=False)
             else:
-                dividend_trailing_yield = self._format_dividend_yield(info.get('trailingAnnualDividendYield'), is_percentage_point=False)
+                # Yahoo's precomputed trailing yield has appeared in both
+                # fraction and percentage-point scales; do not infer its unit.
+                dividend_trailing_yield = None
 
             record = {
                 'stock_id': stock_id,
@@ -1492,13 +1646,24 @@ class DataMapper:
                 'report_date': datetime.now().strftime('%Y-%m-%d'),
                 
                 # Ownership percentages
-                'insider_ownership_pct': float(info.get('heldPercentInsiders', 0) * 100) if info.get('heldPercentInsiders') else None,
-                'institutional_ownership_pct': float(info.get('heldPercentInstitutions', 0) * 100) if info.get('heldPercentInstitutions') else None,
+                # Legacy table contract is percentage points. Validate provider
+                # fractions first and convert once at this producer boundary.
+                'insider_ownership_pct': (
+                    provider_fraction(info.get('heldPercentInsiders')) * 100
+                    if provider_fraction(info.get('heldPercentInsiders')) is not None else None
+                ),
+                'institutional_ownership_pct': (
+                    provider_fraction(info.get('heldPercentInstitutions')) * 100
+                    if provider_fraction(info.get('heldPercentInstitutions')) is not None else None
+                ),
                 
                 # Short Selling
                 'shares_short': float(info.get('sharesShort')) if info.get('sharesShort') else None,
                 'short_ratio_days': float(info.get('shortRatio')) if info.get('shortRatio') else None,
-                'short_pct_float': float(info.get('shortPercentOfFloat', 0) * 100) if info.get('shortPercentOfFloat') else None,
+                'short_pct_float': (
+                    provider_fraction(info.get('shortPercentOfFloat')) * 100
+                    if provider_fraction(info.get('shortPercentOfFloat')) is not None else None
+                ),
                 'shares_short_prev': float(info.get('sharesShortPriorMonth')) if info.get('sharesShortPriorMonth') else None,
                 
                 # Dilution
@@ -1585,6 +1750,7 @@ class DataMapper:
                 return []
             
             records = []
+            seen_business_keys = set()
             
             def safe_float(value, max_value=None):
                 """Convert to float, handling NaN and Infinity"""
@@ -1605,12 +1771,15 @@ class DataMapper:
             for idx, row in insider_df.iterrows():
                 # Handle different possible column names from yfinance
                 transaction_date = None
-                if 'Start Date' in row:
-                    transaction_date = pd.to_datetime(row['Start Date']).strftime('%Y-%m-%d')
-                elif 'Date' in row:
-                    transaction_date = pd.to_datetime(row['Date']).strftime('%Y-%m-%d')
-                elif isinstance(idx, (pd.Timestamp, datetime, date)):
-                    transaction_date = pd.to_datetime(idx).strftime('%Y-%m-%d')
+                try:
+                    if 'Start Date' in row:
+                        transaction_date = pd.to_datetime(row['Start Date'], errors='coerce').strftime('%Y-%m-%d')
+                    elif 'Date' in row:
+                        transaction_date = pd.to_datetime(row['Date'], errors='coerce').strftime('%Y-%m-%d')
+                    elif isinstance(idx, (pd.Timestamp, datetime, date)):
+                        transaction_date = pd.to_datetime(idx).strftime('%Y-%m-%d')
+                except (TypeError, ValueError, AttributeError):
+                    transaction_date = None
                 
                 if not transaction_date:
                     continue
@@ -1633,7 +1802,42 @@ class DataMapper:
                     'transaction_date': transaction_date,
                     'shares_change': shares,
                     'transaction_price': price,
+                    # SEC accession numbers are the preferred idempotency key;
+                    # provider feeds that omit them remain covered by the
+                    # historical business-key index.
+                    'accession_number': next((
+                        str(row.get(key)).strip() for key in
+                        ('Accession Number', 'accession', 'accession_number', 'Filing ID')
+                        if row.get(key) not in (None, '', 'nan')
+                    ), None),
+                    'filing_date': next((
+                        str(row.get(key)).strip() for key in ('Filing Date', 'filing_date')
+                        if row.get(key) not in (None, '', 'nan')
+                    ), None),
+                    'transaction_code': next((
+                        str(row.get(key)).strip().upper() for key in ('Transaction Code', 'transaction_code', 'Code')
+                        if row.get(key) not in (None, '', 'nan')
+                    ), None),
+                    'ownership_type': next((
+                        str(row.get(key)).strip() for key in ('Ownership', 'ownership_type', 'Direct/Indirect')
+                        if row.get(key) not in (None, '', 'nan')
+                    ), None),
+                    'source_url': next((
+                        str(row.get(key)).strip() for key in ('URL', 'url', 'source_url', 'Filing URL')
+                        if row.get(key) not in (None, '', 'nan')
+                    ), None),
+                    'retrieved_at': datetime.now(timezone.utc).isoformat(),
                 }
+
+                # A filing can contain multiple transaction lines; dedupe only
+                # exact replay of the same accession/date/share tuple.
+                dedupe_key = (
+                    record['accession_number'], transaction_date, shares
+                ) if record['accession_number'] else None
+                if dedupe_key is not None:
+                    if dedupe_key in seen_business_keys:
+                        continue
+                    seen_business_keys.add(dedupe_key)
                 
                 # Calculate estimated value if we have shares and price
                 # Cap at 10^15 to avoid database numeric overflow (field is NUMERIC(18,2), max ~10^16)
@@ -1779,16 +1983,12 @@ class DataMapper:
             # Extract Altman Z-Score components
             components = risk_profile.get('altman_components', {})
             
-            # Calculate bankruptcy risk percentage from risk zone
+            # bankruptcy_risk is stored ONLY when the risk model supplied a real probability.
+            # (It used to be filled with a constant per zone - Safe=10, Caution=50, Distress=90 - which
+            # presented an invented number as a measured one; the zone itself is the honest signal.)
             risk_zone = risk_profile.get('altman_risk_zone', 'Unknown')
-            bankruptcy_risk_map = {
-                'Safe': 10.0,      # < 10% bankruptcy risk
-                'Caution': 50.0,   # ~50% bankruptcy risk
-                'Distress': 90.0,  # > 90% bankruptcy risk
-                'Unknown': None
-            }
-            bankruptcy_risk = bankruptcy_risk_map.get(risk_zone)
-            
+            bankruptcy_risk = None
+
             # Override with actual value if provided
             if 'altman_bankruptcy_risk' in risk_profile:
                 bankruptcy_risk_str = risk_profile.get('altman_bankruptcy_risk')
@@ -1903,7 +2103,13 @@ class DataMapper:
             logger.error(f"Error mapping regime risk data: {e}")
             return None
 
-    def map_stock_news_data(self, stock_id: int, news: List[Dict], ticker: str = None) -> List[Dict]:
+    def map_stock_news_data(
+        self,
+        stock_id: int,
+        news: List[Dict],
+        ticker: str = None,
+        company_name: str = None,
+    ) -> List[Dict]:
         """
         Map stock-specific news articles to stock_news_data table
         
@@ -2012,10 +2218,10 @@ class DataMapper:
                     
                     if published_ts:
                         try:
-                            # Handle Unix timestamp format (Finnhub)
+                            # Handle Unix timestamp format (Finnhub, Yahoo search); UTC, whatever the machine's zone
                             if isinstance(published_ts, (int, float)) and published_ts > 1000000000:
-                                from datetime import datetime as dt
-                                published_date = dt.fromtimestamp(published_ts).isoformat()
+                                from datetime import datetime as dt, timezone as tz
+                                published_date = dt.fromtimestamp(published_ts, tz.utc).isoformat()
                             # Handle ISO string format (yfinance)
                             elif isinstance(published_ts, str):
                                 published_date = published_ts
@@ -2036,6 +2242,34 @@ class DataMapper:
                     if 'datetime' in article:  # Finnhub uses 'datetime'
                         source_api = 'finnhub'
                     
+                    # Reject broad market headlines that carry no explicit
+                    # issuer signal. This prevents false ticker sentiment.
+                    import re
+                    issuer_tokens = [str(ticker or '').strip().upper()]
+                    if company_name:
+                        normalized_company = str(company_name).strip().upper()
+                        issuer_tokens.append(normalized_company)
+                        # Headlines commonly use the short issuer name rather
+                        # than the legal suffix ("Apple" vs "Apple Inc.").
+                        issuer_tokens.extend(
+                            part for part in re.split(r"[^A-Z0-9]+", normalized_company)
+                            if len(part) >= 4 and part not in {"INC", "CORP", "LTD", "PLC", "COMPANY"}
+                        )
+                    article_text = f"{title} {summary or ''}".upper()
+                    related = article.get('relatedTickers') or article.get('related_tickers') or []
+                    related_text = ' '.join(str(value).upper() for value in related) if isinstance(related, (list, tuple)) else str(related).upper()
+                    explicit_match = any(
+                        token and (
+                            re.search(rf"(?<![A-Z0-9]){re.escape(token)}(?![A-Z0-9])", article_text)
+                            or re.search(rf"(?<![A-Z0-9]){re.escape(token)}(?![A-Z0-9])", related_text)
+                        )
+                        for token in issuer_tokens
+                    )
+                    if not explicit_match:
+                        skipped_count += 1
+                        logger.info("  📰 Article %s: skipped as irrelevant to %s", i, ticker or company_name)
+                        continue
+
                     # Create record for database
                     record = {
                         'stock_id': stock_id,

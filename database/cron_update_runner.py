@@ -1,23 +1,39 @@
 #!/usr/bin/env python3
 """
-Automated Cron Update Runner & Web Service
+Automated Cron Update Runner (cloud edition)
 ============================================
 
-Daemon batch runner designed for Render free-tier Web Services.
-Features:
-1. Starts a lightweight background HTTP server binding to PORT (default 10000) to pass Render's port scan.
-2. Serves a live, real-time status dashboard ('dashboard.html') updated after each stock sync.
-3. Automatically runs in a persistent loop, sleeping during active market hours to avoid rate conflicts.
+Runs the same per-stock export as tickzen-github's ``database/cron_update_runner.py`` (the macOS launchd
+job), as one of several workers on Azure. The data written per stock is identical; the shared rules live in
+modules synced from tickzen-github:
+
+* ``database/updater_schedule.py`` - **when** (only while the US market is closed: trading days 16:30-09:00
+  New York time, weekends and NYSE holidays all day) and **what is stale** (no successful sync since the
+  latest trading-day 16:30 ET), plus the split of the stock list into ``WORKER_COUNT`` equal parts.
+* ``database/updater_locks.py`` - per-stock advisory locks, one run per worker, one earnings step at a time.
+* ``database/updater_run_log.py`` - the run log shown on the admin dashboard (/admin/db-updater).
+
+Worker ``WORKER_INDEX`` exports its own part first, then helps with stale stocks of the other parts, so a
+worker whose IP gets blocked does not leave its part stale. Stocks are claimed one at a time, right before each
+export, so an idle worker can always take over what another has not reached yet.
+
+**Hourly batches.** The job starts every hour (at :30). Each run exports at most ``STOCKS_PER_RUN`` stocks
+(default 70) and stops after ``RUN_TIME_BUDGET_MINUTES`` (default 55), then waits for the next hour. Inside a
+run every Yahoo request is spaced evenly to ``YAHOO_REQUESTS_PER_HOUR`` (``database/yahoo_pacer.py``), so
+neither the hour nor any single minute sees a burst. A real HTTP 429 pauses the worker for a minute and halves
+its pace until the run ends; ``STOP_AFTER_429`` of them end the run early.
+
+    python database/cron_update_runner.py --preview      # show this worker's queue, export nothing
+    python database/cron_update_runner.py                # what the scheduled job runs
+    python database/cron_update_runner.py --limit 5 --force
 """
 
 import os
 import sys
-import json
-import logging
-import socket
-import threading
 import time
-from datetime import datetime, date, timezone, timedelta
+import logging
+import requests
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Add parent directory to path
@@ -25,6 +41,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
 load_dotenv()
+
+from database.updater_schedule import (  # noqa: E402
+    MARKET_TZ, assign_parts, in_export_window, is_current, latest_session_cutoff, parse_hhmm, sync_instant,
+    DEFAULT_START, DEFAULT_STOP,
+)
 
 # Set up logging
 log_dir = Path(__file__).parent / 'logs'
@@ -40,520 +61,337 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def check_internet(host="8.8.8.8", port=53, timeout=3) -> bool:
-    """Check if the system has an active internet connection using a DNS socket test."""
+RATE_LIMIT_MARKERS = ('rate_limited', 'too many requests', 'rate limit', '429', 'invalid crumb', 'crumb', 'unauthorized')
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name, "").strip()
+    return int(value) if value else default
+
+
+def internet_and_ip(timeout=8):
+    """(online, egress IP) from Cloudflare's trace endpoint.
+
+    Deliberately not a Yahoo URL: Yahoo answers a plain ``requests`` call with HTTP 429, which the pacer took as
+    throttling and halved the worker's speed for the whole night (2026-10-15/16). The egress IP is what Yahoo
+    throttles on, so it is logged and shown on the dashboard.
+    """
     try:
-        socket.setdefaulttimeout(timeout)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
-        return True
-    except socket.error:
-        return False
+        response = requests.get("https://www.cloudflare.com/cdn-cgi/trace", timeout=timeout)
+        fields = dict(line.split("=", 1) for line in response.text.splitlines() if "=" in line)
+        return response.ok, fields.get("ip")
+    except requests.RequestException as exc:
+        logger.warning(f"HTTPS connectivity check failed: {exc}")
+        return False, None
 
-def log_public_ip():
-    """Retrieve and log the current instance's public IP address for debugging multi-instance throttling."""
-    try:
-        import requests
-        ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
-        logger.info(f"ℹ️ Current Instance Public IP: {ip} (Use this to verify if Render instances share an IP pool)")
-    except Exception as e:
-        logger.warning(f"⚠️ Could not retrieve public IP address: {e}")
-
-def log_rate_limit_diagnostics():
-    """Log yfinance rate-limiting troubleshooting and architecture recommendations."""
-    guide = """
-================================================================================
-YFINANCE RATE-LIMITING DIAGNOSTICS & TROUBLESHOOTING GUIDE
-================================================================================
-Yahoo Finance has throttled this instance or detected session abnormalities.
-
-Things you can try immediately:
-1. Restart the affected service:
-   - Sometimes yfinance gets stuck with a bad/stale cookie crumb.
-   - Restarting the process destroys the session cache and forces a fresh crumb fetch.
-2. Upgrade yfinance:
-   - Run: pip install -U yfinance
-   - Yahoo Finance changes its internal APIs frequently; keeping it up-to-date is crucial.
-3. Verify if Render is using a shared IP pool:
-   - On all active Render instances, run:
-     import requests
-     print(requests.get("https://api.ipify.org").text)
-   - If they share the same IP (e.g., 34.55.100.20), Yahoo throttles the shared IP capacity.
-   - If they differ, the throttle is due to request volume/session-related issues per container.
-
-Production Recommendation:
-- Do not rely on Yahoo Finance as the sole production source fetched independently by workers.
-- Recommended Architecture:
-  Yahoo Finance API -> One dedicated single-threaded collector service -> Azure PostgreSQL DB -> All workers read from DB
-  (This avoids concurrent IP/session scraping spikes and uses database cache instead of direct scraping).
-================================================================================
-"""
-    logger.warning(guide)
 
 def get_exporter_and_client():
-    """Dynamically load the appropriate database client and exporter."""
-    from analysis_scripts.peer_comparison import get_db_client
-    db_client = get_db_client()
-    
-    if db_client is None:
-        logger.error("Could not initialize database client.")
-        return None, None, None
-
-    azure_url = os.getenv("AZURE_POSTGRES_URL") or os.getenv("DATABASE_URL")
-    if azure_url or os.getenv("AZURE_POSTGRES_HOST"):
-        try:
-            from database.export_to_azure_postgres import AzurePostgresDataExporter
-            exporter = AzurePostgresDataExporter()
-            return exporter, db_client, "azure"
-        except Exception as e:
-            logger.error(f"Failed to load AzurePostgresDataExporter: {e}")
-            
+    """Load the Azure exporter and the DB client it owns."""
+    if not (os.getenv("AZURE_POSTGRES_URL") or os.getenv("DATABASE_URL") or os.getenv("AZURE_POSTGRES_HOST")):
+        logger.error("Azure Postgres is not configured (set AZURE_POSTGRES_URL or AZURE_POSTGRES_HOST/USER/PASSWORD/DB).")
+        return None, None
     try:
-        from database.export_to_supabase import SupabaseDataExporter
-        exporter = SupabaseDataExporter()
-        return exporter, db_client, "supabase"
+        from database.export_to_azure_postgres import AzurePostgresDataExporter
+        exporter = AzurePostgresDataExporter()
+        # Use the exact client owned by the exporter. This avoids creating
+        # a second Azure connection for the scheduler's stale-stock query.
+        return exporter, exporter.db
     except Exception as e:
-        logger.error(f"Failed to load SupabaseDataExporter: {e}")
+        logger.error(f"Failed to load AzurePostgresDataExporter: {e}")
+        return None, None
 
-    return None, None, None
-
-def load_tickers_list() -> list:
-    """Load tickers from stock_tickers_list.json."""
-    json_path = Path(__file__).parent / "stock_tickers_list.json"
-    try:
-        with open(json_path, "r") as f:
-            data = json.load(f)
-            tickers = data.get("tickers", [])
-            seen = set()
-            deduped = [x.upper() for x in tickers if not (x.upper() in seen or seen.add(x.upper()))]
-            return deduped
-    except Exception as e:
-        logger.error(f"Failed to load stock_tickers_list.json: {e}")
-        return []
 
 def load_tickers_from_db(db) -> list:
-    """Fetch active tickers from monitored_tickers table."""
-    try:
-        res = db.table('monitored_tickers').select('symbol').eq('is_active', True).execute()
-        if hasattr(res, 'data') and res.data:
-            tickers = [r['symbol'].upper() for r in res.data if r.get('symbol')]
-            tickers.sort()
-            return tickers
-        return []
-    except Exception as e:
-        logger.warning(f"Could not load tickers from database 'monitored_tickers' table (using fallback): {e}")
-        return []
+    """Active symbols in monitored_tickers, oldest additions first (deduplicated, upper-case)."""
+    rows = db.table('monitored_tickers').select('symbol', 'created_at').eq('is_active', True).order('created_at').execute().data
+    seen = set()
+    return [s for s in (str(r.get('symbol') or '').strip().upper() for r in rows) if s and not (s in seen or seen.add(s))]
 
-def update_dashboard():
-    """Trigger dashboard HTML regeneration."""
-    try:
-        from database.generate_dashboard import main as run_dashboard_gen
-        run_dashboard_gen()
-        logger.info("Dashboard HTML page updated successfully.")
-    except Exception as e:
-        logger.warning(f"Failed to regenerate dashboard HTML: {e}")
 
-def start_dashboard_web_server():
-    """Start a background HTTP server serving dashboard.html to pass Render's port checks."""
-    import http.server
-    import socketserver
-    
-    port = int(os.getenv("PORT", 10000))
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
-    class DashboardHandler(http.server.SimpleHTTPRequestHandler):
-        def do_GET(self):
-            if self.path == '/' or self.path == '/index.html':
-                dashboard_path = os.path.join(project_root, 'dashboard.html')
-                if os.path.exists(dashboard_path):
-                    self.send_response(200)
-                    self.send_header('Content-type', 'text/html')
-                    self.end_headers()
-                    with open(dashboard_path, 'rb') as f:
-                        self.wfile.write(f.read())
-                    return
-            return super().do_GET()
-            
-        def log_message(self, format, *args):
-            # Suppress HTTP access logging to keep application logs clean
-            pass
+def build_queue(db, tickers: list, cutoff: datetime, worker_index: int, worker_count: int):
+    """Returns (own, others, counts): stale stocks of this worker's part and of the other parts.
 
-    socketserver.TCPServer.allow_reuse_address = True
-    try:
-        server = socketserver.TCPServer(('0.0.0.0', port), DashboardHandler)
-        logger.info(f"✓ Dashboard Web Server started successfully on port {port}")
-        t = threading.Thread(target=server.serve_forever, daemon=True)
-        t.start()
-        return server
-    except Exception as e:
-        logger.error(f"❌ Failed to start dashboard web server on port {port}: {e}")
-        return None
-
-def handle_ticker_sync_result(db, ticker, result):
+    Each list: stocks not yet in ``stocks`` first, then the rest by oldest successful sync.
     """
-    Update ticker's consecutive failure count in monitored_tickers.
-    If it hits 3 consecutive failures, delete the ticker.
-    """
-    ticker_upper = ticker.upper().strip()
-    status = result.get('status', 'failed')
-    errors = result.get('errors', [])
-    
-    # Check if this was a temporary rate limit or connection issue
-    is_temporary = any(
-        keyword in str(e).lower()
-        for e in errors
-        for keyword in ['rate_limited', 'too many requests', 'rate limit', 'invalid crumb', 'unauthorized', 'cooldown']
-    )
-    
-    # If the sync succeeded or was partial without rate limit errors, we reset failures to 0
-    is_success = (status in ('success', 'partial')) and not is_temporary
-    
+    db_map = {s['symbol'].upper(): s for s in
+              db.table('stocks').select('symbol', 'last_sync_date', 'last_sync_status').execute().data}
+    oldest = datetime.min.replace(tzinfo=timezone.utc)
+
+    def order(symbols):
+        new = [s for s in symbols if s not in db_map]
+        old = sorted((s for s in symbols if s in db_map),
+                     key=lambda s: sync_instant(db_map[s].get('last_sync_date')) or oldest)
+        return new + old
+
+    home = assign_parts(tickers, worker_count)
+    stale = [s for s in tickers if s not in db_map
+             or not is_current(db_map[s].get('last_sync_date'), db_map[s].get('last_sync_status'), cutoff)]
+    own = [s for s in stale if home[s] == worker_index]
+    others = [s for s in stale if home[s] != worker_index]
+    counts = {
+        'total': len(tickers),
+        'own_total': sum(1 for s in tickers if home[s] == worker_index),
+        'current': len(tickers) - len(stale),
+        'new': sum(1 for s in stale if s not in db_map),
+        'own_stale': len(own),
+        'others_stale': len(others),
+    }
+    return order(own), order(others), counts
+
+
+def is_rate_limited(errors) -> bool:
+    return any(marker in str(err).lower() for err in (errors or []) for marker in RATE_LIMIT_MARKERS)
+
+
+def run_earnings_step(locks) -> None:
+    """Recent-reporter history refresh. Freshness-gated, never fatal, one worker at a time. (Implied moves need live
+    option quotes, so they run in the market-hours job database/implied_moves_job.py, not here.)"""
+    if not locks.earnings():
+        logger.info("Earnings step is running on another worker - skipping.")
+        return
     try:
-        # 1. Fetch current consecutive_failures count
-        res = db.table('monitored_tickers').select('consecutive_failures').eq('symbol', ticker_upper).execute()
-        if not res.data:
-            return # Ticker not in monitored_tickers
-            
-        current_failures = res.data[0].get('consecutive_failures') or 0
-        
-        if is_success:
-            if current_failures > 0:
-                db.table('monitored_tickers').update({'consecutive_failures': 0}).eq('symbol', ticker_upper).execute()
-                logger.info(f"✓ Reset consecutive failures for {ticker_upper} to 0")
-        elif is_temporary:
-            logger.info(f"ℹ Ticker {ticker_upper} sync failed/partial due to temporary rate limits or provider cooldown. Preserving consecutive_failures={current_failures}.")
-        else:
-            # It's a hard data availability failure
-            new_failures = current_failures + 1
-            logger.warning(f"⚠ Ticker {ticker_upper} failed data sync (Hard failure {new_failures}/3)")
-            
-            if new_failures >= 3:
-                # Delete the ticker from monitored_tickers
-                db.table('monitored_tickers').delete().eq('symbol', ticker_upper).execute()
-                logger.error(f"❌ Ticker {ticker_upper} deleted from monitored_tickers after 3 consecutive hard failures (likely delisted or invalid).")
-            else:
-                db.table('monitored_tickers').update({'consecutive_failures': new_failures}).eq('symbol', ticker_upper).execute()
-                
-    except Exception as db_err:
-        logger.warning(f"Could not update monitored_tickers failure count for {ticker_upper}: {db_err}")
-
-def run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index, total_instances, sub_batch_size, sleep_interval_seconds, preview_mode):
-    """Executes a single cycle of checking and updating tickers in sub-batches."""
-    logger.info("Beginning database sync cycle...")
-
-    # Ensure monitored_tickers has consecutive_failures column (Azure Postgres fallback)
-    if db_type == "azure" and hasattr(db, 'execute_raw_sql'):
-        try:
-            db.execute_raw_sql("ALTER TABLE monitored_tickers ADD COLUMN IF NOT EXISTS consecutive_failures INT DEFAULT 0;")
-        except Exception as e:
-            logger.warning(f"Could not ensure consecutive_failures column exists: {e}")
-
-    # Load Tickers
-    all_tickers = load_tickers_from_db(db)
-    fallback_used = False
-    if not all_tickers:
-        logger.warning("No active tickers found in database monitored_tickers. Falling back to JSON.")
-        all_tickers = load_tickers_list()
-        fallback_used = True
-
-    if not all_tickers:
-        logger.error("No stock tickers found. Sync cycle aborted.")
-        return False
-
-    # Apply Alphabetical Workload Slicing
-    if instance_index is not None:
-        chunk_size = (len(all_tickers) + total_instances - 1) // total_instances
-        start_idx = instance_index * chunk_size
-        end_idx = min(start_idx + chunk_size, len(all_tickers))
-        sliced_tickers = all_tickers[start_idx:end_idx]
-        logger.info(f"Instance Partition active: {instance_index}/{total_instances} (Slice range index {start_idx} to {end_idx}).")
-        logger.info(f"Assigned workload: {len(sliced_tickers)} stocks.")
-        run_limit = limit_val if limit_val is not None else len(sliced_tickers)
-    else:
-        offset_val = max(0, offset_val)
-        sliced_tickers = all_tickers[offset_val:]
-        logger.info(f"Direct slicing active: Offset {offset_val}.")
-        logger.info(f"Assigned workload: {len(sliced_tickers)} stocks.")
-        run_limit = limit_val if limit_val is not None else 70
-
-    # Query DB to check today's sync statuses (scoped to this instance's assigned tickers only)
-    try:
-        db_stocks = db.table('stocks').select('symbol', 'last_sync_date').in_('symbol', sliced_tickers).execute()
-        db_map = {}
-        for s in db_stocks.data:
-            symbol = s['symbol'].upper()
-            last_sync = s.get('last_sync_date')
-            db_map[symbol] = last_sync
+        from database.earnings_local_update import run_after_batch
+        run_after_batch()
     except Exception as e:
-        logger.error(f"Failed to fetch stock sync dates from database: {e}")
-        return False
+        logger.warning(f"Earnings local update skipped: {e}")
 
-    # Filter and Prioritize Queue
-    today_str = date.today().isoformat()
-    new_stocks = []
-    pending_stocks = []
-    synced_count = 0
-
-    for ticker in sliced_tickers:
-        ticker_upper = ticker.upper()
-        if ticker_upper not in db_map:
-            new_stocks.append(ticker_upper)
-        else:
-            last_sync = db_map[ticker_upper]
-            if last_sync:
-                if hasattr(last_sync, 'strftime'):
-                    last_sync_date_str = last_sync.strftime('%Y-%m-%d')
-                else:
-                    last_sync_date_str = str(last_sync)
-
-                if last_sync_date_str.startswith(today_str):
-                    synced_count += 1
-                else:
-                    pending_stocks.append((ticker_upper, last_sync_date_str))
-            else:
-                pending_stocks.append((ticker_upper, ""))
-
-    pending_stocks.sort(key=lambda x: x[1] or "")
-    pending_tickers = [x[0] for x in pending_stocks]
-    queue = new_stocks + pending_tickers
-
-    logger.info(f"Queue Status: Synced Today: {synced_count}, New: {len(new_stocks)}, Outdated: {len(pending_tickers)}, Total Pending: {len(queue)}")
-
-    if not queue:
-        logger.info("✓ All assigned stocks are already synced and up-to-date today.")
-        return True
-
-    # Sub-Batch Split
-    target_tickers = queue[:run_limit]
-    chunks = [target_tickers[i:i + sub_batch_size] for i in range(0, len(target_tickers), sub_batch_size)]
-    
-    logger.info(f"Syncing {len(target_tickers)} stocks in {len(chunks)} sub-batches of size {sub_batch_size} (sleep {sleep_interval_seconds}s).")
-    
-    if preview_mode:
-        for chunk_idx, chunk in enumerate(chunks, 1):
-            logger.info(f"Preview [Sub-batch {chunk_idx}/{len(chunks)}]: {', '.join(chunk)}")
-        return True
-
-    # Sync Loop
-    start_time = datetime.now()
-    total_processed = 0
-    total_success = 0
-    total_fail = 0
-    total_partial = 0
-
-    for chunk_idx, chunk in enumerate(chunks, 1):
-        logger.info(f"\n================================================================================")
-        logger.info(f"STARTING SUB-BATCH {chunk_idx}/{len(chunks)} ({len(chunk)} tickers)")
-        logger.info(f"================================================================================\n")
-        
-        if db_type == "azure":
-            try:
-                from database.export_to_azure_postgres import prepare_bulk_prices
-                prepare_bulk_prices(chunk)
-            except Exception as e:
-                logger.warning(f"Failed to prepare bulk prices: {e}")
-
-        chunk_success = 0
-        chunk_fail = 0
-        chunk_partial = 0
-        consecutive_failures = 0
-        aborted_due_to_errors = False
-
-        for idx, ticker in enumerate(chunk, 1):
-            # Check if yfinance rate limit cooldown is active
-            from data_processing_scripts.data_collection import _rate_limit_cooldown_remaining_seconds
-            cooldown_remaining = _rate_limit_cooldown_remaining_seconds()
-            if cooldown_remaining > 0:
-                logger.warning(f"Aborting sync cycle early: yfinance provider rate limit cooldown is active ({int(cooldown_remaining)}s remaining) to avoid continuous failure loop.")
-                log_rate_limit_diagnostics()
-                aborted_due_to_errors = True
-                break
-
-            logger.info(f"[{chunk_idx}/{len(chunks)}][{idx}/{len(chunk)}] Processing {ticker}...")
-            result = None
-            try:
-                result = exporter.export_stock_data(ticker)
-                status = result.get('status', 'failed')
-                if status == 'success':
-                    chunk_success += 1
-                    consecutive_failures = 0
-                elif status == 'partial':
-                    chunk_partial += 1
-                    # Check if the partial success has rate-limiting related errors
-                    has_rate_limit_error = any(
-                        'rate_limited' in str(e).lower() or 
-                        'too many requests' in str(e).lower() or 
-                        'rate limit' in str(e).lower() or
-                        'invalid crumb' in str(e).lower() or
-                        'unauthorized' in str(e).lower()
-                        for e in result.get('errors', [])
-                    )
-                    if has_rate_limit_error:
-                        consecutive_failures += 1
-                    else:
-                        consecutive_failures = 0
-                else:
-                    chunk_fail += 1
-                    # Check if the failure was due to rate limits or crumb errors
-                    has_rate_limit_error = any(
-                        'rate_limited' in str(e).lower() or 
-                        'too many requests' in str(e).lower() or 
-                        'rate limit' in str(e).lower() or
-                        'invalid crumb' in str(e).lower() or
-                        'unauthorized' in str(e).lower()
-                        for e in result.get('errors', [])
-                    )
-                    if has_rate_limit_error:
-                        consecutive_failures += 1
-                    else:
-                        consecutive_failures = 0
-                    logger.error(f"Failed to export {ticker}: {result.get('errors')}")
-            except Exception as e:
-                chunk_fail += 1
-                # Check if the exception indicates rate limits
-                has_rate_limit_error = any(
-                    k in str(e).lower() 
-                    for k in ['rate_limited', 'too many requests', 'rate limit', 'invalid crumb', 'unauthorized']
-                )
-                if has_rate_limit_error:
-                    consecutive_failures += 1
-                else:
-                    consecutive_failures = 0
-                logger.error(f"Exception during export of {ticker}: {e}", exc_info=True)
-                result = {'status': 'failed', 'errors': [str(e)]}
-            
-            # Handle failure count and pruning logic
-            if result:
-                handle_ticker_sync_result(db, ticker, result)
-            
-            # Regenerate live HTML status dashboard after each ticker update
-            update_dashboard()
-
-            if consecutive_failures >= 3:
-                logger.warning("Aborting sync cycle early: Hit 3 consecutive failures. Yahoo Finance may be rate-limiting us or crumb is invalid.")
-                log_rate_limit_diagnostics()
-                aborted_due_to_errors = True
-                break
-
-            # Sleep 30 seconds between tickers to avoid rate limiting and spamming Yahoo Finance
-            if idx < len(chunk):
-                logger.info(f"Sleeping for 30 seconds before processing next ticker...")
-                time.sleep(30)
-
-        total_processed += len(chunk)
-        total_success += chunk_success
-        total_fail += chunk_fail
-        total_partial += chunk_partial
-
-        logger.info(f"Finished Sub-batch {chunk_idx}/{len(chunks)}. Success: {chunk_success}, Failed: {chunk_fail}")
-
-        if aborted_due_to_errors:
-            logger.warning("Stopping entire batch sync because abort flag was raised.")
-            break
-
-        if chunk_idx < len(chunks):
-            logger.info(f"Sleeping for {sleep_interval_seconds / 60:.1f} minutes to bypass rate limits...")
-            time.sleep(sleep_interval_seconds)
-
-    duration = (datetime.now() - start_time).total_seconds()
-    logger.info(f"Batch completed in {duration/60:.1f} minutes. Success: {total_success}, Failed: {total_fail}")
-    return total_fail == 0 and not aborted_due_to_errors
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Cron update runner for TickZen stock data.")
-    parser.add_argument("--preview", action="store_true", help="Preview pending stocks without running the export.")
-    parser.add_argument("--limit", type=int, default=None, help="Number of stocks to process in this batch (default: 70 when not partitioning, or entire slice size when partitioning).")
-    parser.add_argument("--offset", type=int, help="Offset to start slicing the ticker list (overrides env TICKER_BATCH_OFFSET).")
-    parser.add_argument("--instance-index", type=int, help="Index of this instance (0 to total-instances - 1, overrides env INSTANCE_INDEX).")
-    parser.add_argument("--total-instances", type=int, help="Total number of parallel instances (overrides env TOTAL_INSTANCES).")
-    parser.add_argument("--sub-batch-size", type=int, help="Number of stocks to process per sub-batch to avoid rate limits (overrides env SUB_BATCH_SIZE).")
-    parser.add_argument("--batch-sleep", type=int, help="Seconds to sleep between sub-batches (overrides env BATCH_SLEEP_SECONDS).")
-    parser.add_argument("--once", action="store_true", help="Run once and exit instead of starting a persistent HTTP daemon.")
-    parser.add_argument("--force", action="store_true", help="Force execution even outside allowed hours.")
+    parser.add_argument("--preview", action="store_true", help="Show this worker's queue without exporting anything.")
+    parser.add_argument("--limit", type=int, default=env_int("STOCKS_PER_RUN", 70),
+                        help="Max stocks this run exports (default 70, env STOCKS_PER_RUN; 0 = no cap).")
+    parser.add_argument("--max-minutes", type=int, default=env_int("RUN_TIME_BUDGET_MINUTES", 55),
+                        help="Stop starting new stocks after this many minutes (default 55; 0 = until the window closes).")
+    parser.add_argument("--force", action="store_true", help="Run even while the US market is open.")
     args = parser.parse_args()
 
-    # Determine execution window check for single runs
-    if args.once and not args.force:
-        utc_now = datetime.now(timezone.utc)
-        ist_now = utc_now + timedelta(hours=5, minutes=30)
-        current_hour = ist_now.hour
-        current_minute = ist_now.minute
-        is_allowed = 7 <= current_hour < 18 or (current_hour == 18 and current_minute <= 30)
-        if not is_allowed:
-            logger.info(f"Outside allowed database export window (07:00 to 18:30 IST). Current IST: {ist_now.strftime('%H:%M')}. Execution skipped. Use --force to override.")
-            sys.exit(0)
+    worker_index = env_int("WORKER_INDEX", 0)
+    worker_count = max(1, env_int("WORKER_COUNT", 1))
+    help_others = os.getenv("HELP_OTHER_WORKERS", "true").strip().lower() in {"1", "true", "yes", "on"}
+    max_rate_limited = env_int("MAX_CONSECUTIVE_RATE_LIMITED", 3)
+    stop_after_429 = env_int("STOP_AFTER_429", 3)
+    yahoo_per_hour = env_int("YAHOO_REQUESTS_PER_HOUR", 1200)
+    start_et = parse_hhmm(os.getenv("EXPORT_START_ET"), DEFAULT_START)
+    stop_et = parse_hhmm(os.getenv("EXPORT_STOP_ET"), DEFAULT_STOP)
+    if not 0 <= worker_index < worker_count:
+        logger.error(f"WORKER_INDEX={worker_index} must be between 0 and WORKER_COUNT-1 ({worker_count - 1}).")
+        sys.exit(1)
 
-    # 1. Connectivity Check
-    if not check_internet():
+    from database.updater_run_log import RunLog
+    log_meta = dict(worker_name=os.getenv("WORKER_NAME") or f"azure-{worker_index}", worker_index=worker_index,
+                    worker_count=worker_count, region=os.getenv("WORKER_REGION"), image_tag=os.getenv("IMAGE_TAG"),
+                    pace_per_hour=yahoo_per_hour)
+
+    def window_open() -> bool:
+        return args.force or in_export_window(datetime.now(MARKET_TZ), start_et, stop_et)
+
+    now_et = datetime.now(MARKET_TZ)
+    if not window_open():
+        logger.info(f"Execution skipped: US market hours ({now_et.strftime('%a %H:%M')} New York). "
+                    f"Exports run {start_et:%H:%M}-{stop_et:%H:%M} ET on trading days and all day otherwise. "
+                    "Use --force to override.")
+        if not args.preview:
+            try:
+                from database.azure_postgres_client import AzurePostgresClient
+                quick_db = AzurePostgresClient(max_retries=1, timeout=10)
+                RunLog(quick_db, **log_meta).seen("market open - waiting for the close")
+                quick_db.close()
+            except Exception as e:
+                logger.warning(f"Could not record worker heartbeat: {e}")
+        sys.exit(0)
+    cutoff = latest_session_cutoff(now_et, start_et)
+    logger.info(f"Worker {worker_index + 1}/{worker_count}. Stocks are current if synced after "
+                f"{cutoff.strftime('%a %Y-%m-%d %H:%M %Z')}.")
+
+    # 1. Connectivity Check (not against Yahoo, see internet_and_ip)
+    online, egress_ip = internet_and_ip()
+    if not online:
         logger.warning("❌ No active internet connection detected. Skipping execution.")
         sys.exit(0)
-    logger.info("✓ Internet connection verified.")
-    log_public_ip()
+    logger.info(f"✓ Internet connection verified. Egress public IP: {egress_ip}")
+
+    from database import yahoo_pacer
+    pacer = yahoo_pacer.install(yahoo_per_hour)
+    logger.info(f"Yahoo requests paced to {yahoo_per_hour}/hour (one every {3600 / yahoo_per_hour:.1f}s); "
+                f"this run exports at most {args.limit or 'all'} stocks"
+                + (f" within {args.max_minutes} minutes." if args.max_minutes else "."))
 
     # 2. Exporter and DB Setup
-    exporter, db, db_type = get_exporter_and_client()
+    exporter, db = get_exporter_and_client()
     if not exporter or not db:
         logger.error("❌ Failed to set up database connection or exporter. Exiting.")
         sys.exit(1)
-    logger.info(f"✓ Using {db_type.upper()} database configuration.")
+    logger.info("✓ Using AZURE database configuration.")
+    run_log = RunLog(db, egress_ip=egress_ip, **log_meta)
 
-    # Resolve slicing parameters from CLI arguments or Environment Variables
-    env_limit = os.getenv("TICKER_BATCH_LIMIT")
-    env_offset = os.getenv("TICKER_BATCH_OFFSET")
-    env_instance_index = os.getenv("INSTANCE_INDEX")
-    env_total_instances = os.getenv("TOTAL_INSTANCES")
-    env_sub_batch_size = os.getenv("SUB_BATCH_SIZE")
-    env_batch_sleep = os.getenv("BATCH_SLEEP_SECONDS")
+    # 3. Load Tickers from the database
+    try:
+        all_tickers = load_tickers_from_db(db)
+    except Exception as e:
+        logger.error(f"❌ Failed to read monitored_tickers: {e}")
+        run_log.seen(f"error: could not read monitored_tickers ({e})")
+        sys.exit(1)
+    if not all_tickers:
+        logger.error("❌ No active tickers in monitored_tickers. Exiting.")
+        run_log.seen("no active tickers in monitored_tickers")
+        sys.exit(1)
 
-    limit_val = args.limit if args.limit is not None else (int(env_limit) if env_limit else None)
-    offset_val = args.offset if args.offset is not None else (int(env_offset) if env_offset else 0)
-    instance_index = args.instance_index if args.instance_index is not None else (int(env_instance_index) if env_instance_index is not None else None)
-    total_instances = args.total_instances if args.total_instances is not None else (int(env_total_instances) if env_total_instances else 5)
-    
-    sub_batch_size = args.sub_batch_size if args.sub_batch_size is not None else (int(env_sub_batch_size) if env_sub_batch_size else 70)
-    sleep_interval_seconds = args.batch_sleep if args.batch_sleep is not None else (int(env_batch_sleep) if env_batch_sleep else 4200)
+    # 4. Initial queue
+    try:
+        own, others, counts = build_queue(db, all_tickers, cutoff, worker_index, worker_count)
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch stocks from database: {e}")
+        run_log.seen(f"error: could not read stocks ({e})")
+        sys.exit(1)
+    logger.info("Queue Status:")
+    logger.info(f"  - Monitored stocks: {counts['total']} (this worker's part: {counts['own_total']})")
+    logger.info(f"  - Current since the last close: {counts['current']}")
+    logger.info(f"  - New Tickers (Not in DB): {counts['new']}")
+    logger.info(f"  - Stale in this worker's part: {counts['own_stale']}")
+    logger.info(f"  - Stale in other parts: {counts['others_stale']}" + ("" if help_others else " (helping disabled)"))
 
-    # Ensure the dashboard generator sees the same instance partitioning as this
-    # run, even if it was supplied via --instance-index/--total-instances flags
-    # rather than the INSTANCE_INDEX/TOTAL_INSTANCES env vars.
-    if instance_index is not None:
-        os.environ['INSTANCE_INDEX'] = str(instance_index)
-    os.environ['TOTAL_INSTANCES'] = str(total_instances)
+    if args.preview:
+        logger.info(f"Own part, in order: {', '.join(own) or '-'}")
+        if help_others:
+            logger.info(f"Then helping with: {', '.join(others) or '-'}")
+        logger.info("Preview mode active. Exiting without execution.")
+        sys.exit(0)
 
-    if args.once:
-        # Run once and exit (e.g. for Cron run)
-        success = run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index, total_instances, sub_batch_size, sleep_interval_seconds, args.preview)
-        sys.exit(0 if success else 1)
-    
-    # Render Web Service (Daemon mode)
-    # Start web server
-    server = start_dashboard_web_server()
-    # Generate initial dashboard immediately
-    update_dashboard()
+    if not own and not (help_others and others):
+        logger.info("✓ All stocks are up to date since the last close. No execution needed.")
+        run_log.seen("all stocks current")
+        sys.exit(0)
 
-    logger.info("Entering persistent daemon scheduler loop...")
+    from database.updater_locks import UpdaterLocks
+    locks = UpdaterLocks(db)
+    if not locks.worker(worker_index):
+        logger.info(f"Worker {worker_index} is already running elsewhere. Exiting.")
+        sys.exit(0)
+
+    # 5. Export loop: plan the next stocks, claim each one right before exporting it.
+    run_log.start_run(session_cutoff=cutoff)
+    start_time = datetime.now()
+    deadline = time.monotonic() + args.max_minutes * 60 if args.max_minutes > 0 else None
+    attempted = set()   # never retry a stock twice in one run (a partial stock would loop forever)
+    success_count = fail_count = partial_count = helped = 0
+    consecutive_rate_limited = 0
+    earnings_done = False
+    plan: list = []
+    own_set = set(own)
+    first_plan = True
+    stop_reason = None
+    pacer.since_mark()
+
+    from database.export_to_azure_postgres import prepare_bulk_prices
+
+    def check_stop():
+        if not window_open():
+            return 'window_closed'
+        if deadline is not None and time.monotonic() >= deadline:
+            return 'time_budget'
+        if args.limit > 0 and success_count + partial_count + fail_count >= args.limit:
+            return 'batch_done'
+        if consecutive_rate_limited >= max_rate_limited > 0 or pacer.throttled >= stop_after_429 > 0:
+            return 'rate_limited'
+        return None
+
     while True:
-        # Check time window (07:00 to 18:30 IST)
-        # Convert UTC to IST
-        utc_now = datetime.now(timezone.utc)
-        ist_now = utc_now + timedelta(hours=5, minutes=30)
-        
-        current_hour = ist_now.hour
-        current_minute = ist_now.minute
-        
-        is_allowed = 7 <= current_hour < 18 or (current_hour == 18 and current_minute <= 30)
-        
-        if args.force:
-            is_allowed = True
-            
-        if is_allowed:
-            run_sync_cycle(exporter, db, db_type, limit_val, offset_val, instance_index, total_instances, sub_batch_size, sleep_interval_seconds, args.preview)
-            
-            logger.info("Sync cycle complete. Sleeping for 1 hour...")
-            time.sleep(3600)
-        else:
-            logger.info(f"Allowed IST window (07:00 to 18:30) is currently closed. Current IST: {ist_now.strftime('%H:%M')}. Re-checking in 15 minutes...")
-            time.sleep(900)
+        stop_reason = check_stop()
+        if stop_reason:
+            break
+        if not plan:
+            if not first_plan:
+                own, others, _ = build_queue(db, all_tickers, cutoff, worker_index, worker_count)
+                own_set = set(own)
+            first_plan = False
+            own_left = [s for s in own if s not in attempted]
+            if not own_left and not earnings_done:
+                # This worker's part is done: run the earnings step before helping other parts.
+                run_earnings_step(locks)
+                earnings_done = True
+                stop_reason = check_stop()
+                if stop_reason:
+                    break
+            # Own part first; other parts only once it is done (the earnings step runs in between).
+            candidates = own_left or ([s for s in others if s not in attempted] if help_others else [])
+            if not candidates:
+                stop_reason = 'completed'
+                break
+            room = args.limit - (success_count + partial_count + fail_count) if args.limit > 0 else len(candidates)
+            plan = candidates[:room]
+            # One bulk price download for the planned stocks of this worker's own part (others' owners fetch theirs).
+            prefetch = [s for s in plan if s in own_set]
+            if prefetch:
+                try:
+                    prepare_bulk_prices(prefetch)
+                    logger.info(f"Bulk price download for {len(prefetch)} stocks: {pacer.since_mark()} Yahoo requests")
+                except Exception as e:
+                    logger.warning(f"Failed to prepare bulk prices: {e}")
+
+        ticker = plan.pop(0)
+        attempted.add(ticker)
+        if not locks.claim(ticker, cutoff):
+            continue   # being exported by another worker, or already current
+        is_helping = ticker not in own_set
+        logger.info(f"[{success_count + partial_count + fail_count + 1}] Processing {ticker}"
+                    + (" (helping another part)" if is_helping else "") + "...")
+        stock_started = datetime.now(timezone.utc)
+        status, errors = 'failed', []
+        try:
+            result = exporter.export_stock_data(ticker)
+            status = result.get('status', 'failed')
+            errors = result.get('errors') or []
+            if status == 'success':
+                success_count += 1
+            elif status == 'partial':
+                partial_count += 1
+            else:
+                fail_count += 1
+                logger.error(f"Failed to export {ticker}: {errors}")
+        except Exception as e:
+            fail_count += 1
+            errors = [str(e)]
+            logger.error(f"Exception during export of {ticker}: {e}", exc_info=True)
+        finally:
+            locks.release(ticker)
+        stock_requests = pacer.since_mark()
+        helped += is_helping
+        run_log.stock(ticker, status, stock_started, own_part=not is_helping,
+                      yahoo_requests=stock_requests, errors=errors,
+                      run_yahoo_requests=pacer.total, run_yahoo_429=pacer.throttled,
+                      run_pace_per_hour=round(pacer.per_hour))
+        logger.info(f"  {ticker}: {stock_requests} Yahoo requests "
+                    f"(run total {pacer.total}, 429s {pacer.throttled}, pace {pacer.per_hour:.0f}/hour)")
+        consecutive_rate_limited = consecutive_rate_limited + 1 if is_rate_limited(errors) else 0
+
+    if stop_reason == 'rate_limited':
+        logger.warning("Stopping run: Yahoo rate limits. Unfinished stocks stay queued for the next hourly run "
+                       "and for the other workers.")
+    elif stop_reason == 'completed' and not earnings_done and window_open():
+        run_earnings_step(locks)
+
+    locks.close()
+    duration = (datetime.now() - start_time).total_seconds()
+    processed = success_count + partial_count + fail_count
+    run_log.finish(stop_reason or 'completed', yahoo_requests=pacer.total, yahoo_429=pacer.throttled,
+                   pace_per_hour=round(pacer.per_hour))
+
+    logger.info("\n" + "="*80)
+    logger.info(f"BATCH EXPORT RUN COMPLETE ({stop_reason})")
+    logger.info("="*80)
+    logger.info(f"Duration: {duration/60:.1f} minutes")
+    logger.info(f"Processed: {processed} ({helped} helped from other parts)")
+    logger.info(f"Success: {success_count}")
+    logger.info(f"Partial: {partial_count}")
+    logger.info(f"Failed: {fail_count}")
+    logger.info(f"Yahoo requests: {pacer.total} ({pacer.total / processed:.1f} per stock), 429 responses: {pacer.throttled}"
+                if processed else f"Yahoo requests: {pacer.total}, 429 responses: {pacer.throttled}")
+    logger.info("="*80 + "\n")
+
+    sys.exit(0 if fail_count == 0 and stop_reason != 'rate_limited' else 1)
+
 
 if __name__ == "__main__":
     main()

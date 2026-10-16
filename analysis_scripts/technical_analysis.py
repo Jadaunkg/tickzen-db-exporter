@@ -105,7 +105,7 @@ Chart Generation:
 - **Plotly Charts**: Interactive web-ready visualizations
 - **Matplotlib Charts**: High-quality static images for reports
 - **Custom Styling**: Professional chart themes and layouts
-- **Export Formats**: PNG, SVG, HTML, PDF support
+- **Export Formats**: PNG, SVG, HTML support
 
 Signal Interpretation:
 ---------------------
@@ -1035,7 +1035,7 @@ INDUSTRY_RISKS: dict = {
         {"category": "Rapid Technology Obsolescence", "severity": "medium",
          "text": "Fast-moving innovation cycles can render existing products or platforms less competitive, requiring continuous heavy R&D investment to maintain market position."},
     ],
-    "Software—Application": [
+    "Software - Application": [
         {"category": "Customer Churn / NRR Pressure", "severity": "medium",
          "text": "SaaS businesses depend on net revenue retention. A slowdown in enterprise IT spending or increased competition can compress NRR and slow ARR growth."},
         {"category": "AI Disruption to SaaS", "severity": "high",
@@ -1043,7 +1043,7 @@ INDUSTRY_RISKS: dict = {
         {"category": "Concentration in SMB vs. Enterprise", "severity": "low",
          "text": "Heavy exposure to SMB customers increases churn risk during economic downturns, as smaller businesses cut software spend faster than large enterprises."},
     ],
-    "Software—Infrastructure": [
+    "Software - Infrastructure": [
         {"category": "Pricing Pressure from Hyperscalers", "severity": "high",
          "text": "AWS, Azure, and Google Cloud bundle competing infrastructure services, creating ongoing price competition that can compress margins for independent infrastructure software vendors."},
         {"category": "Open-Source Competition", "severity": "medium",
@@ -1073,7 +1073,7 @@ INDUSTRY_RISKS: dict = {
         {"category": "Patent Cliff / Generic Competition", "severity": "medium",
          "text": "Approaching patent expirations invite generic and biosimilar competition that can rapidly erode pricing power and market share on blockbuster drugs."},
     ],
-    "Drug Manufacturers—General": [
+    "Drug Manufacturers - General": [
         {"category": "Drug Pricing / Political Risk", "severity": "high",
          "text": "Government pressure on drug pricing (IRA provisions, Medicare negotiation) and PBM dynamics can structurally compress pharmaceutical revenue and margins."},
         {"category": "Patent Cliff", "severity": "high",
@@ -1089,7 +1089,7 @@ INDUSTRY_RISKS: dict = {
         {"category": "Regulatory Capital Requirements", "severity": "medium",
          "text": "Evolving Basel III endgame rules and stress-test requirements could force higher capital retention, reducing capital returns to shareholders."},
     ],
-    "Banks—Diversified": [
+    "Banks - Diversified": [
         {"category": "Net Interest Margin Compression", "severity": "high",
          "text": "Rate cuts erode NIM on floating-rate assets faster than on fixed-rate liabilities, directly pressuring bank profitability."},
         {"category": "Commercial Real Estate Exposure", "severity": "high",
@@ -1103,7 +1103,7 @@ INDUSTRY_RISKS: dict = {
         {"category": "Regulatory / Environmental Liability", "severity": "medium",
          "text": "Climate-related regulations, carbon taxes, and environmental compliance costs continue to increase, adding to operating expenses and capex burdens."},
     ],
-    "Retail—Cyclical": [
+    "Retail - Cyclical": [
         {"category": "Consumer Spending Sensitivity", "severity": "high",
          "text": "Discretionary retailers are highly sensitive to consumer confidence and disposable income. Economic downturns can trigger sharp revenue declines."},
         {"category": "Inventory Management Risk", "severity": "medium",
@@ -1315,28 +1315,45 @@ def generate_quantitative_risks(info: dict) -> list:
 def get_industry_risks(sector: str, industry: str, company_summary: str = "") -> list:
     """
     Return structured industry-specific risk factors from the INDUSTRY_RISKS library.
-    Falls back to sector-level risks, then generic risks. Returns up to 5 entries.
+
+    Priority order, most reliable first:
+      1. Exact match on yfinance's `industry` taxonomy string (e.g. "Internet Content &
+         Information", "Semiconductors") - deterministic, always wins outright and skips
+         the heuristic below entirely. This is what correctly routes Alphabet/Google to the
+         ad-business risk set instead of the AI-infra one, even though its business summary
+         mentions "AI infrastructure" in passing (Google Cloud's product name).
+      2. AI-infrastructure keyword heuristic over industry+summary text - only consulted when
+         there's no exact industry match, so it can still catch niche "neocloud"/GPU-cloud
+         providers that yfinance files under a generic industry (e.g. "Software - Infrastructure"
+         variants it hasn't been mapped for, or an unrecognised industry string).
+      3. Generic sector-level entry (e.g. the broad "Technology" bucket) - deliberately checked
+         after the heuristic, not before, so it can't preempt a genuine AI-infra match just
+         because the ticker's sector happens to be "Technology".
+      4. Universal generic risks as the final fallback.
     """
-    sector_l = (sector or "").lower()
-    industry_l = (industry or "").lower()
-    summary_l = (company_summary or "").lower()
-
-    ai_infra_keywords = [
-        'ai infrastructure', 'gpu cloud', 'gpu clusters', 'cloud infrastructure', 'infrastructure-as-a-service',
-        'data center', 'compute platform', 'ai cloud', 'model training', 'inference workloads', 'neocloud'
-    ]
-    adtech_keywords = ['advertising', 'ad targeting', 'search advertising', 'cookie', 'digital ad']
-    looks_like_ai_infra = any(k in f"{industry_l} {summary_l}" for k in ai_infra_keywords)
-    looks_like_adtech = any(k in summary_l for k in adtech_keywords)
-
-    if looks_like_ai_infra and not looks_like_adtech:
-        return list(_AI_CLOUD_INFRA_RISKS)[:5]
-
     risks = INDUSTRY_RISKS.get(industry or "", [])
+
+    if not risks:
+        industry_l = (industry or "").lower()
+        summary_l = (company_summary or "").lower()
+
+        ai_infra_keywords = [
+            'ai infrastructure', 'gpu cloud', 'gpu clusters', 'cloud infrastructure', 'infrastructure-as-a-service',
+            'data center', 'compute platform', 'ai cloud', 'model training', 'inference workloads', 'neocloud'
+        ]
+        adtech_keywords = ['advertising', ' ads,', ' ads.', 'ad targeting', 'search advertising', 'cookie', 'digital ad']
+        looks_like_ai_infra = any(k in f"{industry_l} {summary_l}" for k in ai_infra_keywords)
+        looks_like_adtech = any(k in summary_l for k in adtech_keywords)
+
+        if looks_like_ai_infra and not looks_like_adtech:
+            risks = list(_AI_CLOUD_INFRA_RISKS)
+
     if not risks and sector:
         risks = INDUSTRY_RISKS.get(sector, [])
+
     if not risks:
         risks = _GENERIC_RISKS
+
     return list(risks)[:5]  # Cap at 5 industry risks per report
 
 

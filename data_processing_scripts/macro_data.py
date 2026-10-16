@@ -2,10 +2,22 @@
 
 import pandas as pd
 import os
+import socket
 import numpy as np
 import requests
+import urllib3.util.connection as _urllib3_conn
 from pathlib import Path
 from dotenv import load_dotenv
+
+# On networks without real IPv6 (this dev machine included), DNS still returns
+# a synthesized IPv6 (NAT64) address ahead of the working IPv4 one, and
+# urllib3 (unlike curl's Happy Eyeballs) tries addresses sequentially rather
+# than racing them - so every request stalls ~30s on the broken IPv6 path
+# before falling back to IPv4. Confirmed directly: an identical FRED request
+# went from 30.6s to 0.57s once forced to resolve IPv4 only. No endpoint this
+# app talks to (FRED, yfinance, Alpaca) needs IPv6, so this is a safe
+# process-wide fix, not just a macro_data.py-specific workaround.
+_urllib3_conn.allowed_gai_family = lambda: socket.AF_INET
 
 # Load .env from project root
 root_env = Path(__file__).resolve().parents[1] / ".env"
@@ -18,7 +30,7 @@ except (ImportError, TypeError) as e:
     pdr = None
     import logging as _log
     _log.getLogger(__name__).warning(f"pandas_datareader unavailable ({e}); macro data will use cached/fallback values")
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import logging
 
 from data_processing_scripts.date_utils import normalize_date_series
@@ -289,7 +301,12 @@ def fetch_macro_indicators(app_root, start_date=None, end_date=None, stock_data=
 
     logger.info("Cache miss or invalid for macro data. Proceeding to download from FRED.")
     try:
-        if start_date is None: start_date = '1954-07-01' #
+        # Full history back to 1954 was taking 30+ seconds per series (72 years
+        # of daily observations) on every cache invalidation, yet preprocess_data()
+        # only ever uses the overlap with the stock data's own date range (stock
+        # history here typically runs ~10 years) - the rest was always discarded.
+        # 15 years covers every realistic stock history window with room to spare.
+        if start_date is None: start_date = (datetime.today() - timedelta(days=15 * 365)).strftime('%Y-%m-%d')
         if end_date is None: end_date = datetime.today().strftime('%Y-%m-%d') #
 
         macro_data_download = None
@@ -354,17 +371,18 @@ def fetch_macro_indicators(app_root, start_date=None, end_date=None, stock_data=
         logger.error(f"Macro data fetch/processing error: {e}", exc_info=True) 
         logger.info("Generating fallback dataset due to error.")
         
-        fb_start_date_str = start_date if isinstance(start_date, str) else (start_date.strftime('%Y-%m-%d') if start_date else '1954-07-01')
+        default_fallback_start = (datetime.today() - timedelta(days=15 * 365)).strftime('%Y-%m-%d')
+        fb_start_date_str = start_date if isinstance(start_date, str) else (start_date.strftime('%Y-%m-%d') if start_date else default_fallback_start)
         fb_end_date_str = end_date if isinstance(end_date, str) else (end_date.strftime('%Y-%m-%d') if end_date else datetime.today().strftime('%Y-%m-%d'))
 
         try:
             dates = pd.date_range(start=fb_start_date_str, end=fb_end_date_str) #
-            if dates.empty: 
+            if dates.empty:
                  logger.warning(f"Fallback date range is invalid or empty ({fb_start_date_str} to {fb_end_date_str}). Using default fallback range.")
-                 dates = pd.date_range(start="1954-07-01", end=datetime.today())
+                 dates = pd.date_range(start=default_fallback_start, end=datetime.today())
         except Exception as date_err:
             logger.error(f"Error creating date range for fallback: {date_err}. Using default fallback range.")
-            dates = pd.date_range(start="1954-07-01", end=datetime.today())
+            dates = pd.date_range(start=default_fallback_start, end=datetime.today())
 
 
         fallback_df = pd.DataFrame({'Date': dates})

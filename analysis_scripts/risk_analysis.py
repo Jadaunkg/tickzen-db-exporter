@@ -153,6 +153,35 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from risk_free_rate_fetcher import fetch_current_risk_free_rate
 
+def coerce_to_date(value):
+    """Any date-like value -> datetime.date (or None).
+
+    Handles epoch seconds, ISO strings, date, datetime and pandas.Timestamp. A Timestamp IS a datetime
+    subclass, so it must be converted with .date() explicitly: leaving it a Timestamp made
+    ``date.today() - period_end`` raise, which was swallowed and silently dropped ALL Altman metadata
+    (calculation method, data age, coefficients) for every stock.
+    """
+    from datetime import date as _date, datetime as _datetime
+
+    if value is None:
+        return None
+    if isinstance(value, _datetime):          # includes pandas.Timestamp
+        return value.date()
+    if isinstance(value, _date):
+        return value
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return _datetime.fromtimestamp(value).date()
+        except (OverflowError, OSError, ValueError):
+            return None
+    try:
+        return _datetime.fromisoformat(str(value)).date()
+    except (TypeError, ValueError):
+        return None
+
+
 class RiskAnalyzer:
     """Advanced risk analysis for stock evaluation"""
     
@@ -264,10 +293,7 @@ class RiskAnalyzer:
             if info is None:
                 from data_processing_scripts.data_collection import _yf_ticker
                 stock = _yf_ticker(ticker)
-                info = stock.info if stock is not None else None
-            
-            if info is None:
-                info = {}
+                info = stock.info
             
             # Get historical data (90 days for volume analysis)
             if processed_data is not None and not processed_data.empty:
@@ -292,7 +318,11 @@ class RiskAnalyzer:
             volume_score = min(100, (avg_volume / 10_000_000) * 100) * 0.6
             
             # Component 2: Market Capitalization (15% weight)
-            market_cap = info.get('marketCap', 0)
+            # `info` may already have been supplied by the pipeline. Do not
+            # dereference the local `stock` variable here: it is only created
+            # when the caller omitted `info`, and that bug silently disabled
+            # liquidity exports for most normal database syncs.
+            market_cap = info.get('marketCap', 0) if info else 0
             
             if market_cap == 0:
                 # Fallback: estimate from shares outstanding
@@ -403,10 +433,7 @@ class RiskAnalyzer:
             if info is None:
                 from data_processing_scripts.data_collection import _yf_ticker
                 stock = _yf_ticker(ticker)
-                info = stock.info if stock is not None else None
-            
-            if info is None:
-                info = {}
+                info = stock.info
 
             def _clean_numeric(value):
                 if value is None or pd.isna(value):
@@ -426,8 +453,8 @@ class RiskAnalyzer:
                 if stock is None:
                     from data_processing_scripts.data_collection import _yf_ticker
                     stock = _yf_ticker(ticker)
-                annual_bs = stock.balance_sheet if stock is not None else None
-                annual_is = stock.financials if stock is not None else None
+                annual_bs = stock.balance_sheet
+                annual_is = stock.financials
 
             if annual_bs is not None and not annual_bs.empty and annual_is is not None and not annual_is.empty:
                 candidates.append((annual_bs.iloc[:, 0].to_dict(), annual_is.iloc[:, 0].to_dict(), annual_bs.columns[0], 'annual'))
@@ -436,8 +463,8 @@ class RiskAnalyzer:
                 if stock is None:
                     from data_processing_scripts.data_collection import _yf_ticker
                     stock = _yf_ticker(ticker)
-                quarterly_bs = stock.quarterly_balance_sheet if stock is not None else None
-                quarterly_is = stock.quarterly_financials if stock is not None else None
+                quarterly_bs = stock.quarterly_balance_sheet
+                quarterly_is = stock.quarterly_financials
                 if quarterly_bs is not None and not quarterly_bs.empty and quarterly_is is not None and not quarterly_is.empty:
                     candidates.append((quarterly_bs.iloc[:, 0].to_dict(), quarterly_is.iloc[:, 0].to_dict(), quarterly_bs.columns[0], 'quarterly'))
             except Exception:
@@ -488,7 +515,7 @@ class RiskAnalyzer:
             market_cap = _clean_numeric(info.get('marketCap'))
             market_cap_source = 'current_market_cap'
             shares_outstanding = _clean_numeric(info.get('sharesOutstanding'))
-            if shares_outstanding and period_end_date is not None and stock is not None:
+            if shares_outstanding and period_end_date is not None:
                 try:
                     pe = pd.Timestamp(period_end_date)
                     hist = stock.history(
@@ -887,30 +914,14 @@ class RiskAnalyzer:
         # ========================================================================
         if ticker:
             try:
-                altman_result = self.calculate_altman_z_score_robust(
-                    ticker,
-                    info=info,
-                    balance_sheet=balance_sheet,
-                    financials=financials
-                )
+                altman_result = self.calculate_altman_z_score_robust(ticker)
                 
                 if altman_result and 'z_score' in altman_result:
                     # Calculate data age
                     period_end = altman_result.get('period_end_date')
                     
-                    # Convert period_end to date
-                    if period_end:
-                        try:
-                            if hasattr(period_end, 'date'):
-                                period_end = period_end.date()
-                            elif isinstance(period_end, (int, float)):
-                                period_end = datetime.fromtimestamp(period_end).date()
-                            else:
-                                period_end = pd.Timestamp(period_end).date()
-                        except Exception as parse_err:
-                            logging.warning(f"Could not parse period_end {period_end}: {parse_err}")
-                            period_end = None
-                    
+                    period_end = coerce_to_date(period_end)
+
                     if period_end:
                         data_age_days = (datetime.now().date() - period_end).days
                     else:

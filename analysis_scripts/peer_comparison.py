@@ -6,11 +6,44 @@ import pandas as pd
 import numpy as np
 import requests
 import os
+import threading
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import functools
 
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(funcName)s - %(message)s')
+
+def normalize_debt_to_equity(raw):
+    """Provider debtToEquity (percentage points) -> debt/equity multiple.
+
+    ``"N/A"``/None/non-numeric values pass through unchanged so the caller's existing
+    missing-data handling keeps working. No magnitude test: the provider unit is fixed.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return raw
+    if raw != raw or raw in (float("inf"), float("-inf")):
+        return "N/A"
+    return raw / 100.0
+
+
+def peer_dividend_yield_percentage_points(info):
+    """Calculate peer yield from the annual cash amount and matching quote.
+
+    Yahoo's precomputed yield fields have appeared in inconsistent scales, so
+    this producer does not normalize them. Percentage points are derived from
+    trailing annual cash per share divided by the quote price.
+    """
+    rate = info.get("trailingAnnualDividendRate")
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    try:
+        rate = float(rate)
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(rate) or not np.isfinite(price) or rate < 0 or price <= 0:
+        return None
+    return (rate / price) * 100.0
 
 def get_finnhub_api_key():
     """Get Finnhub API key from environment variables or config files."""
@@ -74,26 +107,63 @@ def fetch_company_peers(ticker):
     
     return []
 
+_db_client_cache = None
+_db_client_cache_attempted = False
+_db_client_ready = False
+_db_client_lock = threading.RLock()
+
+
 def get_db_client():
-    """Try to initialize and return a database client (Azure Postgres or Supabase)."""
+    """Thread-safe accessor: concurrent first callers wait for the one initialisation instead of seeing a half-built cache.
+
+    (Previously `_db_client_cache_attempted` was set before the client existed, so a burst of parallel tool calls right
+    after start-up got None and reported their database as "not configured".)
+    """
+    global _db_client_ready
+    if _db_client_ready:
+        return _db_client_cache
+    with _db_client_lock:
+        client = _get_db_client_locked()
+        _db_client_ready = True
+        return client
+
+
+def _get_db_client_locked():
+    """
+    Try to initialize and return a database client (Azure Postgres or Supabase).
+
+    Cached at module level for the life of the process: AzurePostgresClient()
+    opens a fresh psycopg2 connection (a full TCP+SSL handshake to Azure - the
+    dominant cost in report generation, ~30s from this environment) on every
+    call, but this was being called once per report even though
+    AzurePostgresClient.connection is already thread-local and lazily
+    reconnects if the underlying connection ever goes stale/closed - so a
+    single cached client is safe to reuse across calls and threads.
+    """
+    global _db_client_cache, _db_client_cache_attempted
+    if _db_client_cache_attempted:
+        return _db_client_cache
+    _db_client_cache_attempted = True
+
     # Check if we can use Azure PostgreSQL
     azure_url = os.getenv("AZURE_POSTGRES_URL") or os.getenv("DATABASE_URL")
     if azure_url or os.getenv("AZURE_POSTGRES_HOST"):
         try:
             from database.azure_postgres_client import AzurePostgresClient
-            client = AzurePostgresClient()
-            return client
+            _db_client_cache = AzurePostgresClient()
+            return _db_client_cache
         except Exception as e:
             logging.warning(f"Failed to initialize AzurePostgresClient in peer comparison: {e}")
-            
+
     # Check if we can use Supabase
     if os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_KEY"):
         try:
             from database.supabase_client import get_supabase_client
-            return get_supabase_client()
+            _db_client_cache = get_supabase_client()
+            return _db_client_cache
         except Exception as e:
             logging.warning(f"Failed to initialize SupabaseClient in peer comparison: {e}")
-            
+
     return None
 
 def fetch_peers_from_db(ticker, db_client=None):
@@ -178,9 +248,7 @@ def analyze_insider_availability(ticker):
         import yfinance as yf
         
         stock = _yf_ticker(ticker)
-        info = stock.info if stock is not None else None
-        if info is None:
-            info = {}
+        info = stock.info
         
         reasons = []
         
@@ -284,18 +352,170 @@ def fetch_insider_transactions(ticker, months_back=3):
         logging.error(f"Error fetching insider transactions for {ticker}: {e}")
         return []
 
+def get_stock_price_for_date(ticker, target_date, max_days_search=10):
+    """
+    Get historical stock price for a specific date with fallback logic.
+    If exact date not available, search nearby dates within max_days_search range.
+    """
+    # Insider transaction batches routinely contain many rows that share the
+    # same transaction date (e.g. a batch grant or a Form 4 amendment), and
+    # format_insider_transaction_data() calls this once per row - without
+    # caching, that fired one yfinance history() network round trip per row
+    # even when 10+ rows resolved to the same (ticker, date). A historical
+    # close for a given date never changes once the market has closed, so
+    # this is safe to memoize for the life of the process.
+    date_key = target_date.strftime('%Y-%m-%d') if isinstance(target_date, datetime) else str(target_date)[:10]
+    return _get_stock_price_for_date_cached(ticker, date_key, max_days_search)
+
+
+@functools.lru_cache(maxsize=4096)
+def _get_stock_price_for_date_cached(ticker, target_date, max_days_search=10):
+    try:
+        stock = _yf_ticker(ticker)
+
+        # Convert target_date to datetime if it's a string
+        if isinstance(target_date, str):
+            target_date = datetime.strptime(target_date, '%Y-%m-%d')
+
+        # Get historical data around the target date
+        start_date = target_date - timedelta(days=max_days_search)
+        end_date = target_date + timedelta(days=max_days_search)
+
+        hist = stock.history(start=start_date, end=end_date)
+
+        if hist.empty:
+            return None
+
+        # Try to find exact date first
+        target_date_str = target_date.strftime('%Y-%m-%d')
+        if target_date_str in hist.index.strftime('%Y-%m-%d'):
+            exact_match_idx = hist.index[hist.index.strftime('%Y-%m-%d') == target_date_str][0]
+            return hist.loc[exact_match_idx, 'Close']
+
+        # If exact date not found, find the closest date
+        hist_dates = pd.to_datetime(hist.index.date)
+        target_pd = pd.to_datetime(target_date.date())
+
+        # Calculate time differences and find closest
+        time_diffs = abs((hist_dates - target_pd).days)
+        closest_idx = time_diffs.argmin()
+
+        if time_diffs[closest_idx] <= max_days_search:
+            closest_date = hist.index[closest_idx]
+            closest_price = hist.loc[closest_date, 'Close']
+            days_diff = time_diffs[closest_idx]
+
+            logging.info(f"Found price for {ticker} on {closest_date.strftime('%Y-%m-%d')} (${closest_price:.2f}), {days_diff} days from target {target_date_str}")
+            return closest_price
+
+        return None
+
+    except Exception as e:
+        logging.warning(f"Error getting price for {ticker} on {target_date}: {e}")
+        return None
+
+def estimate_price_from_transaction_code(transaction_code, market_price=None):
+    """
+    Estimate transaction nature and provide price context based on transaction codes.
+    Common codes: P=Purchase, S=Sale, A=Award/Grant, M=Exercise, F=Tax withholding
+    """
+    code_meanings = {
+        'P': {'type': 'Purchase', 'price_expected': True, 'description': 'Open market purchase'},
+        'S': {'type': 'Sale', 'price_expected': True, 'description': 'Open market sale'},
+        'A': {'type': 'Award', 'price_expected': False, 'description': 'Stock award/grant (typically no cash price)'},
+        'M': {'type': 'Exercise', 'price_expected': True, 'description': 'Option exercise'},
+        'F': {'type': 'Tax Payment', 'price_expected': False, 'description': 'Shares sold to pay taxes'},
+        'G': {'type': 'Gift', 'price_expected': False, 'description': 'Gift of securities'},
+        'J': {'type': 'Other', 'price_expected': True, 'description': 'Other acquisition'},
+        'K': {'type': 'Equity Swap', 'price_expected': True, 'description': 'Equity swap'},
+        'W': {'type': 'Acquisition', 'price_expected': False, 'description': 'Acquisition or disposition by will'},
+        'D': {'type': 'Disposition', 'price_expected': True, 'description': 'Disposition'}
+    }
+    
+    code_info = code_meanings.get(transaction_code, {
+        'type': 'Unknown', 
+        'price_expected': True, 
+        'description': 'Unknown transaction type'
+    })
+    
+    return code_info
+
+def _batch_fetch_prices_for_dates(ticker, date_strs, max_days_search=10):
+    """
+    Resolve a close price for every date in date_strs with ONE yfinance
+    history() call covering their full span, instead of one call per date.
+    format_insider_transaction_data() needs a price for every transaction
+    that didn't report one, and a 6-12 month insider history routinely spans
+    40-60+ distinct dates - fetching each individually serialized that many
+    network round trips and was the dominant cost in full report generation.
+    Falls back to the same "exact date, else nearest within max_days_search"
+    logic as get_stock_price_for_date(), just resolved against a shared frame.
+    """
+    result = {}
+    unique_dates = []
+    for d in sorted(set(date_strs)):
+        if not d:
+            continue
+        try:
+            unique_dates.append((d, datetime.strptime(d, '%Y-%m-%d')))
+        except (ValueError, TypeError):
+            continue
+    if not unique_dates:
+        return result
+
+    try:
+        stock = _yf_ticker(ticker)
+        start_date = min(dt for _, dt in unique_dates) - timedelta(days=max_days_search)
+        end_date = max(dt for _, dt in unique_dates) + timedelta(days=max_days_search)
+        hist = stock.history(start=start_date, end=end_date)
+        if hist.empty:
+            return result
+
+        hist_date_strs = hist.index.strftime('%Y-%m-%d')
+        hist_dates_normalized = pd.to_datetime(hist.index.date)
+
+        for d_str, d_dt in unique_dates:
+            if d_str in hist_date_strs:
+                exact_idx = hist.index[hist_date_strs == d_str][0]
+                result[d_str] = hist.loc[exact_idx, 'Close']
+                continue
+            target_pd = pd.to_datetime(d_dt.date())
+            time_diffs = abs((hist_dates_normalized - target_pd).days)
+            closest_idx = time_diffs.argmin()
+            if time_diffs[closest_idx] <= max_days_search:
+                closest_date = hist.index[closest_idx]
+                result[d_str] = hist.loc[closest_date, 'Close']
+    except Exception as e:
+        logging.warning(f"Error batch-fetching prices for {ticker}: {e}")
+
+    return result
+
+
 def format_insider_transaction_data(transactions):
     """Format insider transaction data for display with enhanced price handling."""
     if not transactions:
         return []
-    
+
     formatted_transactions = []
     ticker_for_prices = None
-    
+
     # Extract ticker from first transaction if available
     if transactions:
         ticker_for_prices = transactions[0].get('symbol', '').upper()
-    
+
+    # Batch-fetch prices for every date that will need one (see
+    # _batch_fetch_prices_for_dates) before the per-transaction loop below,
+    # so that loop hits an in-memory dict instead of calling yfinance again
+    # for each transaction.
+    price_by_date = {}
+    if ticker_for_prices:
+        dates_needing_prices = [
+            t.get('transactionDate', '') for t in transactions
+            if not (t.get('transactionPrice', 0) and t.get('transactionPrice', 0) > 0)
+        ]
+        if dates_needing_prices:
+            price_by_date = _batch_fetch_prices_for_dates(ticker_for_prices, dates_needing_prices)
+
     for transaction in transactions:
         try:
             # Extract and format transaction data
@@ -333,7 +553,11 @@ def format_insider_transaction_data(transactions):
                 if code_info['price_expected'] and transaction_date and ticker_for_prices:
                     # Try to fetch historical price for the transaction date
                     try:
-                        historical_price = get_stock_price_for_date(ticker_for_prices, transaction_date)
+                        historical_price = price_by_date.get(transaction_date)
+                        if historical_price is None:
+                            # Not resolved by the batch fetch above (e.g. it
+                            # failed outright) - fall back to a single lookup.
+                            historical_price = get_stock_price_for_date(ticker_for_prices, transaction_date)
                         if historical_price and historical_price > 0:
                             price_display = f"~${historical_price:.2f}"
                             price_source = "estimated"
@@ -394,46 +618,59 @@ def get_stock_price_for_date(ticker, target_date, max_days_search=10):
     Get historical stock price for a specific date with fallback logic.
     If exact date not available, search nearby dates within max_days_search range.
     """
+    # Insider transaction batches routinely contain many rows that share the
+    # same transaction date (e.g. a batch grant or a Form 4 amendment), and
+    # format_insider_transaction_data() calls this once per row - without
+    # caching, that fired one yfinance history() network round trip per row
+    # even when 10+ rows resolved to the same (ticker, date). A historical
+    # close for a given date never changes once the market has closed, so
+    # this is safe to memoize for the life of the process.
+    date_key = target_date.strftime('%Y-%m-%d') if isinstance(target_date, datetime) else str(target_date)[:10]
+    return _get_stock_price_for_date_cached(ticker, date_key, max_days_search)
+
+
+@functools.lru_cache(maxsize=4096)
+def _get_stock_price_for_date_cached(ticker, target_date, max_days_search=10):
     try:
         stock = _yf_ticker(ticker)
-        
+
         # Convert target_date to datetime if it's a string
         if isinstance(target_date, str):
             target_date = datetime.strptime(target_date, '%Y-%m-%d')
-        
+
         # Get historical data around the target date
         start_date = target_date - timedelta(days=max_days_search)
         end_date = target_date + timedelta(days=max_days_search)
-        
+
         hist = stock.history(start=start_date, end=end_date)
-        
+
         if hist.empty:
             return None
-        
+
         # Try to find exact date first
         target_date_str = target_date.strftime('%Y-%m-%d')
         if target_date_str in hist.index.strftime('%Y-%m-%d'):
             exact_match_idx = hist.index[hist.index.strftime('%Y-%m-%d') == target_date_str][0]
             return hist.loc[exact_match_idx, 'Close']
-        
+
         # If exact date not found, find the closest date
         hist_dates = pd.to_datetime(hist.index.date)
         target_pd = pd.to_datetime(target_date.date())
-        
+
         # Calculate time differences and find closest
         time_diffs = abs((hist_dates - target_pd).days)
         closest_idx = time_diffs.argmin()
-        
-        if time_diffs.iloc[closest_idx] <= max_days_search:
+
+        if time_diffs[closest_idx] <= max_days_search:
             closest_date = hist.index[closest_idx]
             closest_price = hist.loc[closest_date, 'Close']
-            days_diff = time_diffs.iloc[closest_idx]
-            
+            days_diff = time_diffs[closest_idx]
+
             logging.info(f"Found price for {ticker} on {closest_date.strftime('%Y-%m-%d')} (${closest_price:.2f}), {days_diff} days from target {target_date_str}")
             return closest_price
-        
+
         return None
-    
+
     except Exception as e:
         logging.warning(f"Error getting price for {ticker} on {target_date}: {e}")
         return None
@@ -654,11 +891,31 @@ def analyze_insider_sentiment(transactions):
     
     return " ".join(narrative_parts)
 
-def generate_insider_transactions_html(ticker):
-    """Generate HTML for insider transactions section."""
-    transactions = fetch_insider_transactions(ticker)
-    formatted_transactions = format_insider_transaction_data(transactions)
-    
+def generate_insider_transactions_html(ticker, formatted_transactions=None):
+    """
+    Generate HTML for insider transactions section.
+
+    formatted_transactions: optional pre-fetched result of
+    format_insider_transaction_data() - pass this when the caller already
+    fetched insider transactions for this ticker elsewhere (e.g. the Quick
+    Overview scorecard's Insider Confidence Score), so this doesn't hit the
+    Finnhub API a second time for the same report.
+    """
+    import inspect
+    is_wp = False
+    try:
+        for frame_info in inspect.stack():
+            mod = inspect.getmodule(frame_info.frame)
+            if mod and 'wordpress_reporter' in mod.__name__:
+                is_wp = True
+                break
+    except Exception:
+        pass
+
+    if formatted_transactions is None:
+        transactions = fetch_insider_transactions(ticker)
+        formatted_transactions = format_insider_transaction_data(transactions)
+
     if not formatted_transactions:
         # Analyze why insider data might not be available
         availability_reasons = analyze_insider_availability(ticker)
@@ -790,9 +1047,17 @@ def generate_insider_transactions_html(ticker):
             price_cell = transaction['price']  # Already formatted with explanation
         
         # Enhanced transaction type with code information
-        transaction_type_display = transaction.get('type_detailed', transaction['type'])
-        if transaction.get('code'):
-            transaction_type_display += f' <span class="transaction-code" title="{transaction.get("code_description", "")}">[{transaction["code"]}]</span>'
+        if not is_wp:
+            t_type = transaction['type'].upper()
+            badge_class = "positive" if "BUY" in t_type else ("negative" if "SELL" in t_type else "neutral")
+            badge_text = "BUY" if "BUY" in t_type else ("SELL" if "SELL" in t_type else transaction.get('type_detailed', transaction['type']))
+            transaction_type_display = f'<span class="grid-badge {badge_class}">{badge_text}</span>'
+            if transaction.get('code'):
+                transaction_type_display += f' <span class="transaction-code" title="{transaction.get("code_description", "")}">[{transaction["code"]}]</span>'
+        else:
+            transaction_type_display = transaction.get('type_detailed', transaction['type'])
+            if transaction.get('code'):
+                transaction_type_display += f' <span class="transaction-code" title="{transaction.get("code_description", "")}">[{transaction["code"]}]</span>'
         
         html += f"""
                     <tr class="transaction-row {type_class}">
@@ -823,9 +1088,19 @@ def generate_insider_transactions_html(ticker):
                 price_cell += ' <span class="price-estimated" title="Price estimated from historical data">*</span>'
             elif price_source == 'not_applicable':
                 price_cell = transaction['price']
-            transaction_type_display = transaction.get('type_detailed', transaction['type'])
-            if transaction.get('code'):
-                transaction_type_display += f' <span class="transaction-code" title="{transaction.get("code_description", "")}">[{transaction["code"]}]</span>'
+            
+            if not is_wp:
+                t_type = transaction['type'].upper()
+                badge_class = "positive" if "BUY" in t_type else ("negative" if "SELL" in t_type else "neutral")
+                badge_text = "BUY" if "BUY" in t_type else ("SELL" if "SELL" in t_type else transaction.get('type_detailed', transaction['type']))
+                transaction_type_display = f'<span class="grid-badge {badge_class}">{badge_text}</span>'
+                if transaction.get('code'):
+                    transaction_type_display += f' <span class="transaction-code" title="{transaction.get("code_description", "")}">[{transaction["code"]}]</span>'
+            else:
+                transaction_type_display = transaction.get('type_detailed', transaction['type'])
+                if transaction.get('code'):
+                    transaction_type_display += f' <span class="transaction-code" title="{transaction.get("code_description", "")}">[{transaction["code"]}]</span>'
+            
             hidden_rows_html += f"""
                     <tr class="transaction-row {type_class}">
                         <td class="insider-name">{transaction['name']}</td>
@@ -1020,9 +1295,7 @@ def is_etf(ticker, info=None):
     try:
         if info is None:
             stock = _yf_ticker(ticker)
-            info = stock.info if stock is not None else None
-        if info is None:
-            info = {}
+            info = stock.info
         
         # Common ETF indicators
         etf_indicators = [
@@ -1052,11 +1325,7 @@ def get_peer_metrics(ticker):
             logging.info(f"Fetching metrics for {ticker} (attempt {attempt + 1}/{max_retries})")
             
             stock = _yf_ticker(ticker)
-            if stock is None:
-                raise ValueError("Yahoo Finance ticker object is None")
             info = stock.info
-            if info is None or not isinstance(info, dict) or not info:
-                raise ValueError("Yahoo Finance info is None, empty, or not a dict (rate limited or invalid crumb)")
             
             # Check if this is an ETF
             etf_flag = is_etf(ticker, info=info)
@@ -1120,54 +1389,28 @@ def get_peer_metrics(ticker):
                 # Get Debt-to-Equity with fallbacks
                 debt_to_equity = get_metric_with_fallbacks('debtToEquity', ['totalDebtToEquity'])
                 
-                # Fix D/E formatting: yfinance returns as raw ratio (e.g., 17.08 instead of 0.17)
-                # If D/E > 10, it's likely in percentage points rather than ratio format
-                if debt_to_equity != "N/A" and isinstance(debt_to_equity, (int, float)):
-                    if debt_to_equity > 10:
-                        debt_to_equity = debt_to_equity / 100
-                        logging.info(f"{ticker}: Converted D/E from {debt_to_equity * 100:.2f} to {debt_to_equity:.2f}")
+                # yfinance reports debtToEquity in PERCENTAGE POINTS for every company (78.4 = 0.784x).
+                # The peer table stores the multiple. Convert unconditionally: the previous
+                # "only if > 10" rule left every company with D/E below 10 % (e.g. 2.6 pp) unconverted,
+                # so a 0.026x leverage ratio was published as 2.6x.
+                debt_to_equity = normalize_debt_to_equity(debt_to_equity)
             
-            # Get Dividend Yield with fallbacks (ETFs can have dividend yields)
-            # NOTE: yfinance returns dividendYield already in percentage-point form
-            # (e.g. 0.81 means 0.81%, NOT 81%). Do NOT multiply by 100 if it is already in percent form.
-            # trailingAnnualDividendYield is in decimal fraction form, so we multiply by 100.
-            dividend_yield = info.get('dividendYield')
-            if dividend_yield is not None and dividend_yield != "N/A":
-                try:
-                    dividend_yield = float(dividend_yield)
-                    if 0.0 < dividend_yield < 0.05:
-                        dividend_yield = dividend_yield * 100.0
-                except (ValueError, TypeError):
-                    pass
-            else:
-                trailing_raw = info.get('trailingAnnualDividendYield')
-                if trailing_raw is not None and trailing_raw != "N/A":
-                    try:
-                        dividend_yield = float(trailing_raw) * 100.0
-                    except (ValueError, TypeError):
-                        dividend_yield = "N/A"
-                else:
-                    dividend_yield = info.get('yield', "N/A")
-                    if dividend_yield is not None and dividend_yield != "N/A":
-                        try:
-                            dividend_yield = float(dividend_yield)
-                            if 0.0 < dividend_yield < 0.05:
-                                dividend_yield = dividend_yield * 100.0
-                        except (ValueError, TypeError):
-                            pass
+            # Derive yield from annual cash/share and the matching quote; raw
+            # provider yield fields are omitted because their units vary.
+            dividend_yield = peer_dividend_yield_percentage_points(info)
+            if dividend_yield is None:
+                dividend_yield = "N/A"
             
-            # Compute market cap consistently from shares * live price where possible.
-            market_cap = "N/A"
-            _shares = info.get('sharesOutstanding')
+            # Use the same market cap calculation as the Key Metrics section (single source of
+            # truth) so both sections always agree. This also corrects for multi-class share
+            # structures (e.g. GOOGL/GOOG) where yfinance's 'sharesOutstanding' undercounts shares.
+            from analysis_scripts.fundamental_analysis import get_consistent_market_cap
             _price = info.get('currentPrice', info.get('regularMarketPrice'))
-            try:
-                if _shares is not None and _price is not None:
-                    market_cap = float(_shares) * float(_price)
-                    logging.info(f"{ticker}: Computed market cap from shares * price: {market_cap}")
-                else:
-                    market_cap = get_metric_with_fallbacks('marketCap', ['sharesOutstanding'])
-            except (TypeError, ValueError):
-                market_cap = get_metric_with_fallbacks('marketCap', ['sharesOutstanding'])
+            market_cap = get_consistent_market_cap(info, current_price=_price)
+            if market_cap is None:
+                market_cap = "N/A"
+            else:
+                logging.info(f"{ticker}: Computed market cap via get_consistent_market_cap: {market_cap}")
             
             metrics = {
                 'Market Cap': market_cap,
@@ -1179,7 +1422,10 @@ def get_peer_metrics(ticker):
                 'Debt-to-Equity': debt_to_equity,
                 'Dividend Yield': dividend_yield,
                 '52-Week Range': week_52_range,
-                'shares_outstanding': info.get('sharesOutstanding')
+                'shares_outstanding': info.get('sharesOutstanding'),
+                'quote_currency': info.get('currency'),
+                'exchange': info.get('exchange'),
+                'country': info.get('country'),
             }
             
             # Log any remaining N/A values for debugging (but exclude ETF N/A values)
@@ -1287,54 +1533,36 @@ def get_peer_comparison_data(ticker, db_client=None):
         # Prepare list of all tickers to fetch (target + peers)
         all_tickers = [ticker] + peers
         
-        # Fetch all metrics sequentially if on Render or RUN_SEQUENTIAL is true, otherwise in parallel
-        import os
-        run_sequentially = os.environ.get('RENDER') == 'true' or os.getenv('RUN_SEQUENTIAL', 'true').lower() == 'true'
+        # Use ThreadPoolExecutor for parallel API calls
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
         
         start_time = time.time()
+        logging.info(f"Starting parallel fetch for {ticker} and {len(peers)} peers: {peers}")
         
-        if run_sequentially:
-            logging.info(f"Starting sequential fetch for {ticker} and {len(peers)} peers: {peers} to avoid rate limits")
-            for t in all_tickers:
-                try:
-                    time.sleep(0.5)
-                    metrics = get_peer_metrics(t)
-                    if metrics:
-                        comparison_data[t.upper()] = metrics
-                        logging.info(f"✓ Completed metrics for {t}")
-                    else:
-                        logging.warning(f"✗ No metrics returned for {t}")
-                except Exception as e:
-                    logging.error(f"✗ Error fetching metrics for {t}: {e}")
-        else:
-            # Use ThreadPoolExecutor for parallel API calls
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            logging.info(f"Starting parallel fetch for {ticker} and {len(peers)} peers: {peers}")
+        # Fetch all metrics in parallel (max 6 concurrent connections to avoid rate limits)
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            # Submit all tasks
+            future_to_ticker = {
+                executor.submit(get_peer_metrics, t): t 
+                for t in all_tickers
+            }
             
-            # Fetch all metrics in parallel (max 6 concurrent connections to avoid rate limits)
-            with ThreadPoolExecutor(max_workers=6) as executor:
-                # Submit all tasks
-                future_to_ticker = {
-                    executor.submit(get_peer_metrics, t): t 
-                    for t in all_tickers
-                }
-                
-                # Collect results as they complete
-                for future in as_completed(future_to_ticker):
-                    ticker_name = future_to_ticker[future]
-                    try:
-                        metrics = future.result()
-                        if metrics:
-                            comparison_data[ticker_name.upper()] = metrics
-                            logging.info(f"✓ Completed metrics for {ticker_name}")
-                        else:
-                            logging.warning(f"✗ No metrics returned for {ticker_name}")
-                    except Exception as e:
-                        logging.error(f"✗ Error fetching metrics for {ticker_name}: {e}")
+            # Collect results as they complete
+            for future in as_completed(future_to_ticker):
+                ticker_name = future_to_ticker[future]
+                try:
+                    metrics = future.result()
+                    if metrics:
+                        comparison_data[ticker_name.upper()] = metrics
+                        logging.info(f"✓ Completed metrics for {ticker_name}")
+                    else:
+                        logging.warning(f"✗ No metrics returned for {ticker_name}")
+                except Exception as e:
+                    logging.error(f"✗ Error fetching metrics for {ticker_name}: {e}")
         
         elapsed_time = time.time() - start_time
-        mode_str = "sequential" if run_sequentially else "parallel"
-        logging.info(f"Peer comparison completed for {ticker} with {len(comparison_data)-1} peers in {elapsed_time:.2f}s ({mode_str}): {list(comparison_data.keys())}")
+        logging.info(f"Peer comparison completed for {ticker} with {len(comparison_data)-1} peers in {elapsed_time:.2f}s (parallel): {list(comparison_data.keys())}")
         
         return comparison_data
         

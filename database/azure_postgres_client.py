@@ -18,13 +18,65 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from database.unit_contract import guard_records
+
 try:
     import psycopg2
+    import psycopg2.extensions
     from psycopg2 import sql
     from psycopg2.extras import Json, RealDictCursor, execute_values
     POSTGRES_AVAILABLE = True
 except ImportError:
     POSTGRES_AVAILABLE = False
+
+if POSTGRES_AVAILABLE:
+    # This network's DNS returns a synthesized IPv6/NAT64 address ahead of the
+    # working IPv4 one. psycopg2 does its own C-level (libpq) connection
+    # handling, entirely separate from Python's socket/urllib3 stack, so it
+    # isn't covered by any requests-level IPv6 workaround - it stalls on the
+    # dead IPv6 path for ~30-60s on every single connection before falling
+    # back to IPv4. Verified directly: connecting by hostname took 60.55s;
+    # the identical connection with the host pre-resolved to IPv4 took 0.47s.
+    # Wrapping psycopg2.connect() to resolve hostnames to IPv4 first fixes
+    # this for both call styles (host=... kwargs and DSN/URI strings).
+    import socket as _socket
+    _original_psycopg2_connect = psycopg2.connect
+
+    def _resolve_ipv4(host):
+        try:
+            return _socket.getaddrinfo(host, None, _socket.AF_INET)[0][4][0]
+        except Exception:
+            return host
+
+    # The reverse also happens (an IPv6/NAT64-only network with no IPv4 route): once the IPv4 attempt
+    # fails at the network level, connect by hostname like plain libpq for the next 10 minutes (so a brief
+    # database outage on a healthy IPv4 network doesn't push every later connection onto the slow path).
+    import time as _time
+    _ipv4_unreachable_until = 0.0
+    _NETWORK_ERRORS = ("timeout expired", "unreachable", "no route to host", "could not connect")
+
+    def _ipv4_patched_connect(*args, **kwargs):
+        global _ipv4_unreachable_until
+        if _time.monotonic() >= _ipv4_unreachable_until:
+            try:
+                if args and isinstance(args[0], str):
+                    parsed = psycopg2.extensions.parse_dsn(args[0])
+                    if parsed.get("host"):
+                        parsed["host"] = _resolve_ipv4(parsed["host"])
+                    new_dsn = " ".join(f"{k}='{v}'" for k, v in parsed.items())
+                    return _original_psycopg2_connect(new_dsn, **kwargs)
+                elif kwargs.get("host"):
+                    # a copy, so the fallback below still gets the original hostname
+                    ipv4_kwargs = dict(kwargs, host=_resolve_ipv4(kwargs["host"]))
+                    return _original_psycopg2_connect(*args, **ipv4_kwargs)
+            except psycopg2.OperationalError as exc:
+                if any(s in str(exc).lower() for s in _NETWORK_ERRORS):
+                    _ipv4_unreachable_until = _time.monotonic() + 600
+            except Exception:
+                pass
+        return _original_psycopg2_connect(*args, **kwargs)
+
+    psycopg2.connect = _ipv4_patched_connect
 
 
 logger = logging.getLogger(__name__)
@@ -118,7 +170,8 @@ class AzureTableQuery:
 
     def insert(self, data: Any) -> "AzureTableQuery":
         self._operation = "insert"
-        self._data = _normalize_records(data)
+        # Storage-unit contract (database/unit_contract.py): out-of-contract values never reach the DB.
+        self._data = guard_records(self.table, _normalize_records(data))
         return self
 
     def upsert(
@@ -128,7 +181,7 @@ class AzureTableQuery:
         ignore_duplicates: bool = False,
     ) -> "AzureTableQuery":
         self._operation = "upsert_ignore" if ignore_duplicates else "upsert"
-        self._data = _normalize_records(data)
+        self._data = guard_records(self.table, _normalize_records(data))
         if on_conflict:
             self._on_conflict = [column.strip() for column in on_conflict.split(",") if column.strip()]
         return self
@@ -456,16 +509,16 @@ class AzurePostgresClient:
                 except Exception as rollback_err:
                     logger.warning(f"Rollback failed during error recovery: {rollback_err}")
 
-                # Non-transient errors (bad SQL, constraint violations, bad data) will
-                # never succeed on retry - fail fast instead of wasting up to
-                # 2^max_retries seconds sleeping before raising the same error anyway.
-                if POSTGRES_AVAILABLE and isinstance(error, (
-                    psycopg2.errors.IntegrityError,
-                    psycopg2.errors.ProgrammingError,
-                    psycopg2.errors.DataError,
-                    psycopg2.errors.NotSupportedError,
-                )):
-                    logger.error(f"Non-retryable query error, failing immediately: {error}")
+                # Non-retryable errors: integrity constraint violations (unique, foreign key, check, not null)
+                pgcode = getattr(error, "pgcode", None) or ""
+                is_integrity = (
+                    (POSTGRES_AVAILABLE and isinstance(error, psycopg2.IntegrityError))
+                    or str(pgcode).startswith("23")
+                    or "unique constraint" in str(error).lower()
+                    or "violates foreign key" in str(error).lower()
+                )
+                if is_integrity:
+                    logger.debug(f"Integrity constraint violation (non-retryable): {error}")
                     raise AzurePostgresQueryError(f"Query failed: {error}") from error
 
                 if attempt < self.max_retries - 1:
@@ -478,7 +531,7 @@ class AzurePostgresClient:
                     time.sleep(wait_time)
 
         logger.error(f"Query failed after {self.max_retries} retries: {last_error}")
-        raise AzurePostgresQueryError(f"Query failed: {last_error}")
+        raise AzurePostgresQueryError(f"Query failed: {last_error}") from last_error
 
     def insert(self, table: str, data: Dict[str, Any], return_id: bool = True) -> Dict:
         result = self.table(table).insert(data).execute()
@@ -577,6 +630,86 @@ class AzurePostgresClient:
         for column, value in filters.items():
             query = query.eq(column, value)
         return len(query.execute().data)
+
+    def replace_rows_atomic(
+        self,
+        table: str,
+        filters: Dict[str, Any],
+        records: List[Dict[str, Any]],
+    ) -> int:
+        """Replace a bounded row set in one PostgreSQL transaction.
+
+        This is used for versioned forecast and peer datasets.  It refuses an
+        empty replacement and an unfiltered delete, preventing a failed refresh
+        from erasing the last-known-good public data.
+        """
+        if not filters:
+            raise AzurePostgresQueryError("Atomic replacement requires at least one filter")
+        if not records:
+            raise AzurePostgresQueryError("Atomic replacement refuses an empty record set")
+
+        columns = list(records[0].keys())
+        if not columns or any(list(record.keys()) != columns for record in records):
+            raise AzurePostgresQueryError("Atomic replacement records must share identical columns")
+        # Raw-SQL path: apply the storage-unit contract here too (it bypasses AzureTableQuery).
+        records = guard_records(table, records)
+
+        def _replace() -> int:
+            connection = self.connection
+            try:
+                where_clause = sql.SQL(" AND ").join(
+                    sql.SQL("{} = %s").format(sql.Identifier(column))
+                    for column in filters
+                )
+                delete_query = sql.SQL("DELETE FROM {} WHERE {}").format(
+                    sql.Identifier(table),
+                    where_clause,
+                )
+                insert_query = sql.SQL("INSERT INTO {} ({}) VALUES %s").format(
+                    sql.Identifier(table),
+                    sql.SQL(", ").join(sql.Identifier(column) for column in columns),
+                )
+                values = [
+                    [_adapt_value(record[column]) for column in columns]
+                    for record in records
+                ]
+                with connection.cursor() as cursor:
+                    cursor.execute(delete_query, [_adapt_value(value) for value in filters.values()])
+                    execute_values(cursor, insert_query.as_string(cursor), values)
+                connection.commit()
+                return len(records)
+            except Exception:
+                connection.rollback()
+                raise
+
+        return self._retry_with_backoff(_replace)
+
+    def publish_stock_page_snapshot(self, row: Dict[str, Any]) -> int:
+        """Publish a canonical snapshot and retire the prior one atomically."""
+        if not row or not row.get("stock_id"):
+            raise AzurePostgresQueryError("Snapshot publication requires stock_id")
+        columns = list(row.keys())
+        values = [_adapt_value(row[column]) for column in columns]
+
+        def _publish() -> int:
+            try:
+                with self.connection.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE stock_page_snapshot SET is_current = FALSE WHERE stock_id = %s AND is_current",
+                        (_adapt_value(row["stock_id"]),),
+                    )
+                    insert_query = sql.SQL("INSERT INTO stock_page_snapshot ({}) VALUES ({}) ON CONFLICT (stock_id, content_hash) DO UPDATE SET generated_at = EXCLUDED.generated_at, is_current = EXCLUDED.is_current").format(
+                        sql.SQL(", ").join(sql.Identifier(column) for column in columns),
+                        sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+                    )
+                    cursor.execute(insert_query, values)
+                self.connection.commit()
+                return 1
+            except Exception:
+                self.connection.rollback()
+                raise
+
+        return self._retry_with_backoff(_publish)
 
     def get_stock_by_symbol(self, symbol: str) -> Optional[Dict]:
         records = self.select("stocks", filters={"symbol": symbol.upper()})

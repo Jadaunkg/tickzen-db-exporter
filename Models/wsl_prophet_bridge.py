@@ -131,9 +131,6 @@ import json
 import pandas as pd
 import numpy as np
 from prophet import Prophet
-import pickle
-import base64
-import io
 
 def main():
     """Main function to run Prophet model"""
@@ -147,6 +144,7 @@ def main():
         model_params = config.get('model_params', {})
         forecast_periods = config.get('forecast_periods', 30)
         regressors = config.get('regressors', [])
+        future_frequency = model_params.pop('tickzen_future_frequency', 'D')
 
         # Convert dataframe
         df = pd.DataFrame(df_data)
@@ -163,7 +161,7 @@ def main():
         model.fit(df)
 
         # Make forecast
-        future = model.make_future_dataframe(periods=forecast_periods)
+        future = model.make_future_dataframe(periods=forecast_periods, freq=future_frequency)
 
         # Set cap and floor for logistic growth if they exist in training data
         if 'cap' in df.columns:
@@ -205,12 +203,6 @@ def main():
             for key, value in output['model_info']['params'].items():
                 if isinstance(value, np.ndarray):
                     output['model_info']['params'][key] = value.tolist()
-
-        # Serialize model for potential future use
-        model_buffer = io.BytesIO()
-        pickle.dump(model, model_buffer)
-        model_bytes = model_buffer.getvalue()
-        output['model_pickle'] = base64.b64encode(model_bytes).decode('utf-8')
 
         print(json.dumps(output))
 

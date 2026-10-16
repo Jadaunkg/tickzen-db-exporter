@@ -67,3 +67,7 @@ logs/
 # Cache directories
 generated_data/
 .dcf_cache/
+
+# Merge leftovers and macOS metadata
+*.orig
+.DS_Store

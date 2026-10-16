@@ -25,7 +25,7 @@ This module focuses purely on data collection and does NOT generate any reports.
 import os
 import sys
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Tuple, Optional, List
 import pandas as pd
 import yfinance as yf
@@ -34,13 +34,28 @@ import yfinance as yf
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import data collection functions
-from data_processing_scripts.data_collection import fetch_real_time_data, _yf_ticker
+from data_processing_scripts.data_collection import NEWS_COUNT, fetch_real_time_data, fetch_ticker_news, _yf_ticker
 from data_processing_scripts.macro_data import fetch_macro_indicators
 from data_processing_scripts.data_preprocessing import preprocess_data
-from Models.prophet_model import train_prophet_model
+from Models import forecast_core
+from Models.prophet_model import TICKZEN_PROPHET_PIPELINE_VERSION, train_prophet_model
 from analysis_scripts.fundamental_analysis import extract_quarterly_earnings_data, extract_peer_comparison_data
 
 logger = logging.getLogger(__name__)
+
+def news_time_utc(article: dict) -> Optional[datetime]:
+    """Publish time of a news article as a naive UTC datetime (None when it has none)."""
+    content = article.get('content') if isinstance(article.get('content'), dict) else {}
+    ts = article.get('datetime') or article.get('providerPublishTime') or content.get('publishTime') or content.get('pubDate')
+    if not ts:
+        return None
+    try:
+        if isinstance(ts, (int, float)) and ts > 1000000000:
+            return datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None)
+        stamp = pd.to_datetime(ts)
+        return stamp.tz_convert(None) if stamp.tzinfo is not None else stamp
+    except Exception:
+        return None
 
 
 class PipelineDataCollector:
@@ -63,6 +78,7 @@ class PipelineDataCollector:
         self.ticker = None
         self.timestamp = None
         self.db = None
+        self._loaded_forecast_metadata = None
 
     @property
     def db_client(self):
@@ -96,6 +112,16 @@ class PipelineDataCollector:
             cache_file = cache_dir / f'{ticker}_forecast_{current_month}.json'
             
             if cache_file.exists():
+                # A cache written by an older model version must not be served as current.
+                import json
+                try:
+                    with open(cache_file, 'r') as f:
+                        cached_meta = (json.load(f) or {}).get('forecast_metadata') or {}
+                except Exception:
+                    cached_meta = {}
+                if cached_meta.get('model_version') != TICKZEN_PROPHET_PIPELINE_VERSION:
+                    logger.info(f"  ℹ Cached forecast for {ticker} is from another model version - recalculating")
+                    return False
                 logger.info(f"  ℹ Forecast already calculated for {ticker} this month ({current_month}) - using cached")
                 return True
                 
@@ -105,7 +131,12 @@ class PipelineDataCollector:
             logger.warning(f"Error checking forecast cache: {e}")
             return False  # If we can't check, proceed with calculation to be safe
     
-    def _save_forecast_cache(self, ticker: str, forecast_df: pd.DataFrame) -> None:
+    def _save_forecast_cache(
+        self,
+        ticker: str,
+        forecast_df: pd.DataFrame,
+        forecast_metadata: Optional[Dict] = None,
+    ) -> None:
         """
         Save forecast data to monthly cache file and clean up old forecast files
         
@@ -143,7 +174,8 @@ class PipelineDataCollector:
                 'ticker': ticker,
                 'date': current_month,
                 'created_at': datetime.now().isoformat(),
-                'forecast': forecast_df.to_dict('records') if forecast_df is not None else None
+                'forecast': forecast_df.to_dict('records') if forecast_df is not None else None,
+                'forecast_metadata': forecast_metadata,
             }
             
             with open(cache_file, 'w') as f:
@@ -168,6 +200,8 @@ class PipelineDataCollector:
             from datetime import datetime
             from pathlib import Path
             import json
+
+            self._loaded_forecast_metadata = None
             
             current_month = datetime.now().strftime('%Y-%m')
             
@@ -181,6 +215,8 @@ class PipelineDataCollector:
                 cache_data = json.load(f)
             
             if cache_data.get('forecast'):
+                metadata = cache_data.get('forecast_metadata')
+                self._loaded_forecast_metadata = metadata if isinstance(metadata, dict) else None
                 return pd.DataFrame(cache_data['forecast'])
                 
             return None
@@ -210,11 +246,14 @@ class PipelineDataCollector:
             cache_file = cache_dir / f'{ticker}_profile_{current_month}.json'
             
             if cache_file.exists():
+                if not self._load_company_profile_cache(ticker):
+                    logger.info(f"  ℹ Cached company profile for {ticker} is empty - refetching")
+                    return False
                 logger.info(f"  ℹ Company profile already cached for {ticker} this month ({current_month}) - using cached")
                 return True
-                
+
             return False
-            
+
         except Exception as e:
             logger.warning(f"Error checking company profile cache: {e}")
             return False
@@ -609,6 +648,7 @@ class PipelineDataCollector:
             forecast_response = db_client.table('forecast_data')\
                 .select('forecast_date')\
                 .eq('stock_id', stock_id)\
+                .eq('model_version', TICKZEN_PROPHET_PIPELINE_VERSION)\
                 .gte('created_at', current_month_start)\
                 .limit(1)\
                 .execute()
@@ -651,6 +691,7 @@ class PipelineDataCollector:
         """
         self.ticker = ticker
         self.timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        self._loaded_forecast_metadata = None
         
         result = {
             'ticker': ticker,
@@ -658,6 +699,10 @@ class PipelineDataCollector:
             'collection_status': 'success',
             'errors': []
         }
+        # Only a model trained in this run receives complete provenance.
+        # Monthly cached forecasts predate a durable provenance sidecar and
+        # therefore remain explicitly unversioned until regenerated.
+        result['forecast_metadata'] = None
         
         try:
             logger.info(f"\n{'='*80}")
@@ -752,6 +797,7 @@ class PipelineDataCollector:
                     result['forecast_data'] = cached_forecast
                     result['forecast_model'] = None  # Model not needed for cached data
                     result['actual_data'] = None
+                    result['forecast_metadata'] = self._loaded_forecast_metadata
                     forecast_skipped = True
                     logger.info(f"  ⏭️  Using cached forecast data ({len(cached_forecast)} records)")
                 else:
@@ -774,9 +820,37 @@ class PipelineDataCollector:
                     result['forecast_data'] = forecast_df
                     result['forecast_model'] = model
                     result['actual_data'] = actual_df
+
+                    training_data = result['processed_data'].copy()
+                    clean_rows = pd.DataFrame()
+                    if {'Date', 'Close'}.issubset(training_data.columns):
+                        training_dates = pd.to_datetime(training_data['Date'], errors='coerce')
+                        training_close = pd.to_numeric(training_data['Close'], errors='coerce')
+                        valid_training = training_dates.notna() & training_close.notna() & (training_close > 0)
+                        clean_rows = training_data.loc[valid_training].copy()
+                        clean_rows['_forecast_date'] = training_dates[valid_training]
+                        clean_rows['_forecast_close'] = training_close[valid_training]
+                        clean_rows = clean_rows.drop_duplicates('_forecast_date', keep='last').sort_values('_forecast_date')
+                    if not clean_rows.empty:
+                        last_training_row = clean_rows.iloc[-1]
+                        result['forecast_metadata'] = {
+                            'model_name': 'Prophet',
+                            'method': forecast_core.METHOD_DESCRIPTION,
+                            'model_version': TICKZEN_PROPHET_PIPELINE_VERSION,
+                            'generated_at': datetime.now().astimezone().isoformat(),
+                            'source_class': 'tickzen_statistical_model',
+                            'training_start_date': clean_rows['_forecast_date'].iloc[0].date().isoformat(),
+                            'training_cutoff_date': clean_rows['_forecast_date'].iloc[-1].date().isoformat(),
+                            'input_series': 'Daily yfinance adjusted Close price',
+                            'adjustment_policy': 'yfinance auto_adjust=true; dividend/split-adjusted OHLC series',
+                            'band_definition': forecast_core.BAND_DEFINITION,
+                            'anchor_price': float(last_training_row['_forecast_close']),
+                            'anchor_as_of': last_training_row['_forecast_date'].date().isoformat(),
+                        }
                     
-                    # Cache the forecast for future use this month
-                    self._save_forecast_cache(ticker, forecast_df)
+                    # Persist exact provenance with cached predictions so later
+                    # exports do not manufacture a new model generation date.
+                    self._save_forecast_cache(ticker, forecast_df, result['forecast_metadata'])
                     
                     logger.info(f"  ✓ Generated {len(forecast_df)} days of forecast")
                     
@@ -809,8 +883,10 @@ class PipelineDataCollector:
 
                 def fetch_news():
                     logger.info("  ⚡ Starting news fetch...")
-                    news = yf_ticker.news if hasattr(yf_ticker, 'news') else []
-                    
+                    news = fetch_ticker_news(ticker)
+                    if not news:
+                        logger.warning(f"  ⚠️  Yahoo returned no headlines tagged {ticker.upper()}")
+
                     # Incremental filter
                     try:
                         db_client = self.db_client
@@ -834,23 +910,7 @@ class PipelineDataCollector:
                                     
                                     filtered_news = []
                                     for article in news:
-                                        content_obj = article.get('content', {})
-                                        ts = (article.get('datetime') or 
-                                              article.get('providerPublishTime') or
-                                              content_obj.get('publishTime'))
-                                        
-                                        article_time = None
-                                        if ts:
-                                            try:
-                                                if isinstance(ts, (int, float)) and ts > 1000000000:
-                                                    article_time = datetime.fromtimestamp(ts)
-                                                else:
-                                                    article_time = pd.to_datetime(ts)
-                                                    if article_time.tzinfo is not None:
-                                                        article_time = article_time.tz_convert(None)
-                                            except Exception:
-                                                pass
-                                                
+                                        article_time = news_time_utc(article)
                                         if article_time is None or article_time > last_published:
                                             filtered_news.append(article)
                                     
@@ -929,9 +989,8 @@ class PipelineDataCollector:
                     logger.info("  ⚡ Finished peer comparison fetch.")
                     return peers
 
-                # Submit to ThreadPoolExecutor or run sequentially if on Render / to avoid rate limiting
-                run_sequentially = os.environ.get('RENDER') == 'true' or os.getenv('RUN_SEQUENTIAL', 'true').lower() == 'true'
-                
+                # Submit to ThreadPoolExecutor
+                from concurrent.futures import ThreadPoolExecutor, as_completed
                 tasks = {
                     'info': fetch_info,
                     'news': fetch_news,
@@ -945,28 +1004,15 @@ class PipelineDataCollector:
                 }
 
                 fetched_data = {}
-                if run_sequentially:
-                    logger.info("  ℹ️ Running fundamental fetches sequentially to avoid rate limiting...")
-                    for key, func in tasks.items():
+                with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                    future_to_key = {executor.submit(func): key for key, func in tasks.items()}
+                    for future in as_completed(future_to_key):
+                        key = future_to_key[future]
                         try:
-                            # small delay between fetches to be safe
-                            time.sleep(0.5)
-                            fetched_data[key] = func()
+                            fetched_data[key] = future.result()
                         except Exception as exc:
-                            logger.warning(f"  ⚠️  Sequential fetch for '{key}' generated an exception: {exc}")
+                            logger.warning(f"  ⚠️  Parallel fetch for '{key}' generated an exception: {exc}")
                             fetched_data[key] = None
-                else:
-                    # Submit to ThreadPoolExecutor
-                    from concurrent.futures import ThreadPoolExecutor, as_completed
-                    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-                        future_to_key = {executor.submit(func): key for key, func in tasks.items()}
-                        for future in as_completed(future_to_key):
-                            key = future_to_key[future]
-                            try:
-                                fetched_data[key] = future.result()
-                            except Exception as exc:
-                                logger.warning(f"  ⚠️  Parallel fetch for '{key}' generated an exception: {exc}")
-                                fetched_data[key] = None
 
                 # Process results: info (handle cache & fresh dividends)
                 if profile_cached:
@@ -988,8 +1034,12 @@ class PipelineDataCollector:
                 else:
                     info_val = fetched_data.get('info')
                     result['info'] = info_val if info_val is not None else {}
-                    self._save_company_profile_cache(ticker, result['info'])
-                    logger.info(f"  ✓ Processed and cached fresh company info")
+                    if result['info']:
+                        self._save_company_profile_cache(ticker, result['info'])
+                        logger.info(f"  ✓ Processed and cached fresh company info")
+                    else:
+                        # An empty profile cached for the month would block a refetch and blank the stocks row.
+                        logger.warning(f"  ⚠️  Yahoo returned an empty company profile for {ticker}; not caching it")
 
                 # news
                 news_data = fetched_data.get('news')

@@ -1,6 +1,9 @@
+import hashlib
+import json
 import logging
 import re
 import time
+from datetime import datetime, timezone
 
 import numpy as np
 import yfinance as yf
@@ -47,6 +50,42 @@ DCF_CYCLICAL_RUN_RATE_REVENUE_RATIO_MIN = 0.75
 DCF_CYCLICAL_RUN_RATE_REVENUE_RATIO_MAX = 1.50
 DCF_CYCLICAL_RUN_RATE_MARGIN_RATIO_MIN = 0.80
 DCF_CYCLICAL_RUN_RATE_MARGIN_RATIO_MAX = 1.50
+DCF_MODEL_VERSION = 'tickzen-dcf-universal-v1'
+SUPPORTED_ISO_CURRENCY_CODES = frozenset('''
+    AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND
+    BOB BRL BSD BTN BWP BYN BZD CAD CDF CHF CLP CNY COP CRC CUC CUP CVE CZK
+    DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD GNF GTQ GYD
+    HKD HNL HRK HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF
+    KPW KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP
+    MRU MUR MVR MWK MXN MYR MZN NAD NGN NIO NOK NPR NZD OMR PAB PEN PGK PHP
+    PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG SEK SGD SHP SLE SLL SOS
+    SRD SSP STN SVC SYP SZL THB TJS TMT TND TOP TRY TTD TWD TZS UAH UGX USD
+    UYU UZS VES VND VUV WST XAF XCD XCG XDR XOF XPF XSU YER ZAR ZMW ZWG ZWL
+'''.split())
+
+
+def _normalize_iso_currency(value) -> str | None:
+    """Return a syntactically valid ISO 4217 code, rejecting placeholders."""
+    if not isinstance(value, str):
+        return None
+    currency = value.strip()
+    if currency != currency.upper():
+        return None
+    if currency not in SUPPORTED_ISO_CURRENCY_CODES:
+        return None
+    return currency
+
+
+def _provider_epoch_iso(value, *, date_only: bool = False) -> str | None:
+    """Normalize a provider epoch timestamp without inventing a source date."""
+    try:
+        timestamp = float(value)
+        if not np.isfinite(timestamp) or timestamp <= 0:
+            return None
+        instant = datetime.fromtimestamp(timestamp, timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return instant.date().isoformat() if date_only else instant.isoformat()
 
 # Controlled industry mapping for cycle-aware DCF classification.
 DCF_CYCLICAL_INDUSTRY_KEYWORDS = {
@@ -58,38 +97,6 @@ DCF_CYCLICAL_INDUSTRY_KEYWORDS = {
         'airline', 'air transport', 'shipping', 'transport', 'railroad',
     ),
 }
-
-_TNX_CACHE = {'rate': None, 'fetched_at': 0.0}
-_TNX_CACHE_TTL_SECONDS = 24 * 3600
-
-def _get_cached_10y_treasury_yield(fallback=0.043):
-    """
-    Fetch the ^TNX (10Y Treasury yield) risk-free rate, cached for 24 hours so a
-    batch run across thousands of tickers doesn't hit yfinance once per ticker.
-    """
-    now = time.time()
-    if _TNX_CACHE['rate'] is not None and (now - _TNX_CACHE['fetched_at']) < _TNX_CACHE_TTL_SECONDS:
-        return _TNX_CACHE['rate']
-
-    rate = fallback
-    try:
-        _tnx = yf.download("^TNX", period="5d", progress=False, auto_adjust=True)
-        if not _tnx.empty:
-            _tnx_close = _tnx["Close"].dropna()
-            # Handle MultiIndex columns (yfinance 1.x returns DataFrame for ["Close"])
-            if hasattr(_tnx_close, "ndim") and _tnx_close.ndim == 2:
-                if "^TNX" in _tnx_close.columns:
-                    _tnx_close = _tnx_close["^TNX"]
-                elif len(_tnx_close.columns) == 1:
-                    _tnx_close = _tnx_close.iloc[:, 0]
-            if not _tnx_close.empty:
-                rate = float(_tnx_close.iloc[-1]) / 100.0
-    except Exception:
-        pass  # silently use fallback
-
-    _TNX_CACHE['rate'] = rate
-    _TNX_CACHE['fetched_at'] = now
-    return rate
 
 def safe_get(data_dict, key, default="N/A"):
     """Safely get a value from a dictionary, checking for None and NaN."""
@@ -104,12 +111,67 @@ def safe_get(data_dict, key, default="N/A"):
         return default
     return value
 
+def _compute_beta_from_price_history(ticker: str) -> float | None:
+    """Fallback beta: regress the stock's returns against SPY when yfinance's
+    .info['beta'] field is missing (a known intermittent gap in that
+    metadata endpoint, unrelated to the more reliable price-history endpoint
+    used here). Cov(stock, market) / Var(market), same methodology as
+    RiskAnalyzer.calculate_beta in risk_analysis.py, kept standalone here to
+    avoid instantiating RiskAnalyzer (which also fetches a live risk-free
+    rate we don't need for this).
+
+    Uses 5y monthly returns — the standard convention most data vendors
+    (Bloomberg, stockanalysis.com, Simply Wall St) use, because daily returns
+    are noisy enough to visibly overstate beta (verified: 2y daily gave 2.03
+    for UAL vs. 1.25-1.95 across external sources; 5y monthly gave 1.34,
+    in-range). Steps down to shorter monthly/weekly windows for tickers
+    without 5 years of history (recent IPOs)."""
+    attempts = [
+        ('5y', '1mo', 24),
+        ('2y', '1mo', 18),
+        ('2y', '1wk', 40),
+        ('1y', '1wk', 20),
+    ]
+    for period, interval, min_points in attempts:
+        try:
+            stock_hist = yf.Ticker(ticker).history(period=period, interval=interval)['Close']
+            market_hist = yf.Ticker('SPY').history(period=period, interval=interval)['Close']
+            if stock_hist.empty or market_hist.empty:
+                continue
+
+            stock_returns = stock_hist.pct_change().dropna()
+            market_returns = market_hist.pct_change().dropna()
+            stock_returns, market_returns = stock_returns.align(market_returns, join='inner')
+            if len(stock_returns) < min_points:
+                continue
+
+            market_variance = np.var(market_returns)
+            if not market_variance:
+                continue
+
+            beta = np.cov(stock_returns, market_returns)[0][1] / market_variance
+            if np.isfinite(beta):
+                return float(beta)
+        except Exception as e:
+            logging.warning(f"Price-history beta fallback failed for {ticker} ({period}/{interval}): {e}")
+    return None
+
 def _matches_any(text: str, keywords: tuple[str, ...]) -> bool:
     text = text or ''
     return any(keyword in text for keyword in keywords)
 
 def _round_to_half(value: float) -> float:
     return round(value * 2.0) / 2.0
+
+def _sanitize_dcf_value(value):
+    """Prevent NaN/Infinity from crossing the DCF API boundary."""
+    if isinstance(value, dict):
+        return {key: _sanitize_dcf_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_dcf_value(item) for item in value]
+    if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+        return None
+    return value
 
 # Sectors/industries that should NEVER be classified as cyclical based on beta alone.
 # These companies' beta reflects growth/sentiment volatility, not GDP-cycle sensitivity.
@@ -263,9 +325,63 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
         earnings_growth = safe_get(info, 'earningsGrowth')      # decimal e.g. -0.60
         ebitda          = safe_get(info, 'ebitda')
         total_revenue   = safe_get(info, 'totalRevenue')
+        quote_currency = _normalize_iso_currency(
+            info.get('currency') or info.get('quoteCurrency')
+        )
+        financial_currency = _normalize_iso_currency(info.get('financialCurrency'))
+        quote_as_of = _provider_epoch_iso(info.get('regularMarketTime'))
+        fundamentals_period_end = _provider_epoch_iso(
+            info.get('mostRecentQuarter') or info.get('lastFiscalYearEnd'),
+            date_only=True,
+        )
         sector_raw      = safe_get(info, 'sector', '')
         industry_raw    = safe_get(info, 'industry', '')
         summary_raw     = safe_get(info, 'longBusinessSummary', '')
+
+        # Generic FCFF DCF assumptions are not economically valid for
+        # deposit-taking banks, insurers or REITs.  Fail closed before any
+        # fallback/default inputs can produce a plausible-looking valuation.
+        company_classification_text = ' '.join(
+            str(value or '').lower() for value in (sector_raw, industry_raw, summary_raw)
+        )
+        excluded_dcf_keywords = (
+            'bank', 'banking', 'insurance', 'insurer', 'reit',
+            'real estate investment trust',
+        )
+        if any(keyword in company_classification_text for keyword in excluded_dcf_keywords):
+            return {
+                'error': 'not_applicable',
+                'reason': 'Generic FCFF DCF is not suitable for banks, insurers or REITs; use a sector-specific model.',
+                'applicability': 'not_applicable',
+                'sector': sector_raw,
+                'industry': industry_raw,
+                'quote_currency': quote_currency,
+                'financial_currency': financial_currency,
+            }
+
+        # A per-share quote and financial statements must both have a valid
+        # currency and use the same unit of account. Missing metadata is not
+        # evidence that both values are denominated in the same currency.
+        if not quote_currency or not financial_currency:
+            return {
+                'error': 'currency_unavailable',
+                'reason': (
+                    'A DCF requires valid ISO quote and financial-statement currencies. '
+                    'The available data does not identify both currencies.'
+                ),
+                'quote_currency': quote_currency,
+                'financial_currency': financial_currency,
+            }
+        if quote_currency != financial_currency:
+            return {
+                'error': 'currency_mismatch',
+                'reason': (
+                    f'Currency mismatch: quote is {quote_currency} while financial statements are '
+                    f'{financial_currency}. A verified FX conversion is required before valuation.'
+                ),
+                'quote_currency': quote_currency,
+                'financial_currency': financial_currency,
+            }
 
         def _override_float(name, current_value):
             if name not in calculator_overrides:
@@ -311,8 +427,19 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
         total_debt_f      = _f(total_debt,      0.0)
         total_cash_f      = _f(total_cash,      0.0)
         market_cap_f      = _f(market_cap,      0.0)
-        beta_f            = _f(beta,            1.0)
         price_f           = _f(current_price,   0.0)
+
+        # beta missing from yfinance's .info (a known intermittent gap in that
+        # metadata endpoint) — recover a real, stock-specific value from price
+        # history instead of silently defaulting to a flat 1.0.
+        beta_source = 'override' if 'beta' in calculator_overrides else 'fetched'
+        beta_f = _f(beta, None)
+        if beta_f is None and ticker:
+            beta_f = _compute_beta_from_price_history(ticker)
+            beta_source = 'computed_from_price_history' if beta_f is not None else 'default_fallback'
+        if beta_f is None:
+            beta_f = 1.0
+            beta_source = 'default_fallback'
         
         # --- CRITICAL FIX: Properly calculate shares_f to avoid scaling bugs ---
         shares_raw_f = _f(shares, None)
@@ -326,6 +453,15 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
             shares_f = shares_raw_f
         else:
             shares_f = 0.0
+        if price_f <= 0 or shares_f <= 0:
+            return {
+                'error': 'invalid_input',
+                'reason': 'Current price and diluted shares outstanding must be positive for a per-share DCF.',
+                'current_price': price_f,
+                'shares_outstanding': shares_f,
+                'quote_currency': quote_currency,
+                'financial_currency': financial_currency,
+            }
         ebitda_f          = _f(ebitda)
         total_revenue_f   = _f(total_revenue)
         rev_growth_f      = _f(rev_growth,      0.0)
@@ -364,10 +500,20 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
         historical_fcf_years  = []     # corresponding fiscal years (int), parallel to historical_fcf
         latest_quarter_fcf    = None   # most recent quarterly FCF, used for cyclical run-rate checks
         quarterly_run_rate_samples = []
+        net_buyback_rate      = 0.0    # observed capital-return rate (% of market cap/yr), informational only — not used in per-share math, see STEP 5
         ticker_obj = None
 
         try:
-            ticker_obj = yf.Ticker(ticker) if ticker else None
+            ticker_obj = None
+            if ticker:
+                for attempt in range(1, 3):
+                    try:
+                        ticker_obj = yf.Ticker(ticker)
+                        break
+                    except Exception as e_ticker:
+                        logging.warning(f"yfinance Ticker init failed for {ticker} (attempt {attempt}/2): {e_ticker}")
+                        if attempt < 2:
+                            time.sleep(2)
             if ticker_obj:
                 ann = ticker_obj.financials
                 if ann is not None and not ann.empty:
@@ -404,6 +550,39 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
                             if sbc_val is not None:
                                 stock_based_comp = abs(sbc_val)
                                 break
+
+                    # Net buybacks: real, observed capital allocation (not a modeling
+                    # assumption). Companies that consistently repurchase stock reduce
+                    # share count over time, which raises per-share intrinsic value —
+                    # a mechanism the standard FCF path previously ignored entirely,
+                    # understating names like AAPL/MSFT/GOOGL that return significant
+                    # capital via buybacks. Net of any offsetting issuance (RSU vesting,
+                    # ESPP), expressed as a % of market cap as a standard analyst proxy
+                    # for annual share-count reduction, capped at 5%/yr to avoid a single
+                    # unusual year (e.g. a tender offer) distorting the 10-year projection.
+                    buyback_val = None
+                    for rname in ('Repurchase Of Capital Stock', 'Common Stock Payments'):
+                        if rname in cf.index:
+                            buyback_val = _f(cf.loc[rname].iloc[0])
+                            if buyback_val is not None:
+                                break
+                    issuance_val = None
+                    for rname in ('Issuance Of Capital Stock', 'Common Stock Issuance'):
+                        if rname in cf.index:
+                            issuance_val = _f(cf.loc[rname].iloc[0])
+                            if issuance_val is not None:
+                                break
+                    # Yahoo frequently reports NaN (not 0 or absent) for issuance in years
+                    # with none. NaN is falsy-unsafe (`nan or 0.0` stays nan; `nan > 0` is
+                    # False), which silently zeroed out every buyback-heavy company's rate
+                    # (AAPL, which repurchases $90B+/yr, computed to 0.00%). Sanitize first.
+                    if issuance_val is None or issuance_val != issuance_val:  # NaN check
+                        issuance_val = 0.0
+                    if buyback_val is not None and buyback_val == buyback_val and buyback_val < 0:
+                        net_buyback_amount = abs(buyback_val) - abs(issuance_val)
+                        if net_buyback_amount > 0 and market_cap_f and market_cap_f > 0:
+                            net_buyback_rate = min(net_buyback_amount / market_cap_f, 0.05)
+
                     if ocf_row is not None:
                         for i in range(min(5, len(ocf_row))):
                             ocf_v   = _f(ocf_row.iloc[i])
@@ -482,7 +661,14 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
         # suppress a large-cap transition story with strong current quarterly growth.
         if annual_rev_growth_f is not None:
             if annual_rev_growth_f < 0 and rev_g > 0:
-                effective_rev_g = rev_g
+                # Signals disagree: full fiscal years show revenue declining, but
+                # Yahoo's single-quarter YoY figure is positive. This is usually a
+                # noisy comp (easy prior-year base, one-off item) rather than a
+                # confirmed trend reversal — trust the recovery signal directionally
+                # but cap it. Uncapped, a 40-50%+ single-quarter print (seen on
+                # XOM, CVX, TSLA) fed a decade-long growth anchor straight into the
+                # DCF for companies whose actual annual revenue was flat/declining.
+                effective_rev_g = min(rev_g, 0.15)
             else:
                 effective_rev_g = annual_rev_growth_f
                 # Allow quarterly to act as a floor only if it materially exceeds annual
@@ -577,11 +763,27 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
             recent_q_run_rate = None
             if latest_quarter_fcf is not None and latest_quarter_fcf > 0:
                 recent_q_run_rate = latest_quarter_fcf * 4.0
+                # Sanity-bound against actual trailing-twelve-month FCF, which already
+                # reflects 4 real reported quarters. A single lumpy quarter (asset sale,
+                # working-capital release, tax refund) naively ×4'd can imply a "run rate"
+                # several multiples of what the company has ever actually generated in a
+                # year (seen on XOM: one $17B quarter vs $2-6B in adjacent quarters implied
+                # a $68B/yr run-rate against $20.7B actual TTM FCF). Cap at 2x TTM FCF.
+                if fcf_ttm_f is not None and fcf_ttm_f > 0:
+                    recent_q_run_rate = min(recent_q_run_rate, fcf_ttm_f * 2.0)
 
             cycle_history_base = None
             if historical_fcf:
                 avg_all = sum(historical_fcf) / len(historical_fcf)
                 pos_fcf = [v for v in historical_fcf if v > 0]
+                # Same outlier-year risk as the quarterly run-rate above: a single
+                # historical peak year (e.g. XOM/CVX 2022's oil-price-spike profits)
+                # can pull a straight multi-year average to 2-3x current trailing
+                # cash generation. Cap the normalized base at 2x TTM FCF so cycle
+                # normalization can't imply a "normal" earning power the company
+                # has never actually sustained recently.
+                if avg_all > 0 and fcf_ttm_f is not None and fcf_ttm_f > 0:
+                    avg_all = min(avg_all, fcf_ttm_f * 2.0)
                 if avg_all > 0:
                     cycle_history_base = avg_all
                 elif pos_fcf:
@@ -646,9 +848,15 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
                 ):
                     base_fcf = cycle_history_base
                     base_metric_label = f'Normalized FCF ({len(historical_fcf)}-yr avg, cycle-adjusted)'
-                else:
+                elif recent_q_run_rate is not None:
                     base_fcf = (cycle_history_base + recent_q_run_rate) / 2.0
                     base_metric_label = 'Blended cyclical FCF (normalized + run-rate)'
+                else:
+                    # Most recent quarter's FCF was missing or non-positive (e.g. a
+                    # working-capital-heavy quarter) — fall back to the multi-year
+                    # normalized average rather than crashing on None + float.
+                    base_fcf = cycle_history_base
+                    base_metric_label = f'Normalized FCF ({len(historical_fcf)}-yr avg, cycle-adjusted) — latest quarter unavailable'
             elif recent_q_run_rate is not None:
                 base_fcf = recent_q_run_rate
                 base_metric_label = 'Latest Quarter FCF × 4 (cyclical run-rate)'
@@ -828,9 +1036,21 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
         # FIX K: Use yfinance ^TNX (10Y Treasury yield index) - already imported,
         # no new dependencies. FRED fredgraph.json returns [[timestamp, float], ...]
         # arrays, not dicts, so the previous .get("value") parsing always failed silently.
-        # Cached for 24h (see _get_cached_10y_treasury_yield) so a batch run across
-        # thousands of tickers doesn't re-fetch this once per ticker.
-        risk_free_rate = _get_cached_10y_treasury_yield()
+        risk_free_rate = 0.043  # fallback: 10Y US Treasury
+        try:
+            _tnx = yf.download("^TNX", period="5d", progress=False, auto_adjust=True)
+            if not _tnx.empty:
+                _tnx_close = _tnx["Close"].dropna()
+                # FIX K: Handle MultiIndex columns (yfinance 1.x returns DataFrame for ["Close"])
+                if hasattr(_tnx_close, "ndim") and _tnx_close.ndim == 2:
+                    if "^TNX" in _tnx_close.columns:
+                        _tnx_close = _tnx_close["^TNX"]
+                    elif len(_tnx_close.columns) == 1:
+                        _tnx_close = _tnx_close.iloc[:, 0]
+                if not _tnx_close.empty:
+                    risk_free_rate = float(_tnx_close.iloc[-1]) / 100.0
+        except Exception:
+            pass  # silently use hardcoded fallback
 
         # ERP: Damodaran implied ERP, updated annually. Last confirmed: Jan 2025 = 4.60%.
         # Kept as a configurable constant rather than fetched - Damodaran publishes monthly
@@ -938,6 +1158,19 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
         if mc >= 500e9 and terminal_g > 0.030:
             terminal_g = 0.030
 
+        # Perpetuity terminal value is undefined when terminal growth meets or
+        # exceeds the discount rate. Fail clearly instead of silently clamping
+        # the spread and returning a misleading valuation.
+        if not (-0.10 <= terminal_g < wacc):
+            return {
+                'error': 'invalid_terminal_growth',
+                'reason': 'Terminal growth must be below the discount rate and within a defensible range.',
+                'terminal_growth': terminal_g,
+                'wacc': wacc,
+                'quote_currency': quote_currency,
+                'financial_currency': financial_currency,
+            }
+
         share_dilution_rate = 0.0
         share_dilution_override = calculator_overrides.get('share_dilution_rate')
         if share_dilution_override in (None, ''):
@@ -985,14 +1218,14 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
             bull_g     = min(max_base_g * 1.5, base_g * 1.80)
 
         # -----------------------------------------------------------------------
-        # STEP 5 — 3-Tier 10-Year DCF Projection
+        # STEP 5 — 3-Tier 15-Year DCF Projection
         # Years 1–3: tier-1 growth  (aggressive, anchored to recent actuals)
         # Years 4–7: tier-2 growth  (50% of tier-1, deceleration)
         # Years 8–10: tier-3 growth (50% of tier-2, normalization)
         # Terminal:   type-specific GDP-level rate
         # -----------------------------------------------------------------------
         def _dcf_3tier(fcf_base, g_t1, g_term, wacc_r):
-            """10-year 3-tier DCF. Returns (pv_years_1_10, pv_terminal)."""
+            """15-year 3-tier DCF. Returns (pv_years_1_15, pv_terminal)."""
             # FIX: Deceleration was 50%/25% per tier which was far too aggressive.
             # A company growing 20% would drop to 5% by year 8. Changed to 65%/40%
             # for more realistic fade matching Wall Street analyst conventions.
@@ -1017,7 +1250,7 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
             return pv_sum, pv_tv
 
         def _dcf_revenue_margin_3tier(revenue_base, g_t1, g_term, wacc_r, m_start, m_end):
-            """10-year 3-tier DCF where FCF = Revenue x expanding FCF margin."""
+            """15-year 3-tier DCF where FCF = Revenue x expanding FCF margin."""
             g_t2 = g_t1 * 0.65
             # Clamp g_t3 to max (terminal_g + 0.05) - bridge toward terminal
             g_t3 = min(g_t1 * 0.40, g_term + 0.05)
@@ -1081,6 +1314,18 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
                     pv_fcf, pv_tv, projected_shares = _dcf_revenue_margin_3tier(total_revenue_f, g_t1, g_term, wacc, margin_start or 0.01, m_end)
                 else:
                     pv_fcf, pv_tv = _dcf_3tier(base_fcf, g_t1, g_term, wacc)
+                    # NOTE: buybacks are intentionally NOT modeled as a share-count
+                    # reduction here. A fair-value buyback is per-share value-neutral
+                    # by construction: the cash spent equals the value of the shares
+                    # retired, so removing shares from the denominator without also
+                    # removing the corresponding cash from the FCF stream that
+                    # produced `equity_val` double-counts that value. `equity_val`
+                    # already represents the full pool of value available to today's
+                    # shareholders in aggregate, however the company later chooses to
+                    # distribute it (dividends or buybacks) — dividing by today's
+                    # actual share count is the correct, standard treatment.
+                    # `net_buyback_rate` is still surfaced (see below) as informational
+                    # context, not as a valuation input.
                     projected_shares = shares_f
                 equity_val = pv_fcf + pv_tv + total_cash_f - total_debt_f
                 # FIX H: Equity value floors at 0 - negative equity is not a valid per-share price
@@ -1094,7 +1339,8 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
                     # Report the actual clamped g_t3 used inside _dcf_3tier
                     'growth_tier3':        round(min(g_t1 * 0.40, g_term + 0.05), 4),   # actual rate used (clamped)
                     'terminal_growth':     round(g_term,      4),
-                    'pv_fcf_10yr':         round(pv_fcf / 1e9, 2),  # $B
+                    'pv_fcf_15yr':         round(pv_fcf / 1e9, 2),  # canonical value, $B
+                    'pv_fcf_10yr':         round(pv_fcf / 1e9, 2),  # deprecated compatibility alias, $B
                     'pv_terminal':         round(pv_tv  / 1e9, 2),  # $B
                     'intrinsic_value':     round(intrinsic,   2),
                     'upside_downside_pct': round(updown,      1),
@@ -1104,6 +1350,10 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
                 if dcf_method == 'revenue_margin':
                     scenarios[label]['year1_fcf_margin'] = round(margin_start or 0.0, 4)
                     scenarios[label]['terminal_fcf_margin'] = round(m_end, 4)
+                    # Dilution IS modeled here (unlike buybacks above): SBC-driven share
+                    # issuance is a real cost already reflected in the reduced FCF margin
+                    # (see sbc_penalty), and genuinely transfers value to employees rather
+                    # than being value-neutral like a fair-value buyback.
                     scenarios[label]['projected_shares_10yr'] = round(projected_shares, 2)
 
         # -----------------------------------------------------------------------
@@ -1165,7 +1415,48 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
         if has_projection_base and price_f and price_f > 0 and 'Base' in scenarios:
             base_iv = scenarios['Base']['intrinsic_value']
             if base_iv > 0:
-                implied_annual_return = round((base_iv / price_f) ** (1 / 10) - 1, 4)
+                implied_annual_return = round((base_iv / price_f) ** (1 / 15) - 1, 4)
+
+        # -----------------------------------------------------------------------
+        # STEP 7.5 — Valuation Gap Explanation
+        # A DCF landing below market price is not, by itself, evidence of a
+        # calculation error — it can mean the market is pricing in more
+        # aggressive assumptions than the model's Base Case. Make that
+        # distinction explicit and checkable: compare Base/Bull Case against
+        # what the market is *actually* implying (Step 6), so a large gap
+        # reads as "here's the assumption gap" rather than "the tool is wrong."
+        # -----------------------------------------------------------------------
+        valuation_category = None
+        valuation_context = None
+        if has_projection_base and price_f and price_f > 0 and 'Base' in scenarios:
+            base_gap_pct = scenarios['Base']['upside_downside_pct']
+            bull_gap_pct = scenarios.get('Bull', {}).get('upside_downside_pct')
+
+            if dcf_method == 'revenue_margin':
+                implied_val = market_implied_margin
+                implied_str = f"a ~{implied_val*100:.0f}% sustained terminal FCF margin" if implied_val is not None else None
+            else:
+                implied_val = market_implied_growth
+                implied_str = f"~{implied_val*100:.0f}% annual FCF growth" if implied_val is not None else None
+
+            if base_gap_pct >= 0:
+                valuation_category = 'base_case_at_or_above_market'
+                extra = f" (Base Case is {base_gap_pct:.0f}% above market — the market may be discounting these assumptions, or this is a genuine opportunity; sanity-check the inputs above.)" if base_gap_pct >= 50 else ""
+                valuation_context = f"The Base Case already meets or exceeds the current market price.{extra}"
+            elif bull_gap_pct is not None and bull_gap_pct >= -10:
+                valuation_category = 'requires_bull_case'
+                valuation_context = (
+                    f"The Base Case values this stock {abs(base_gap_pct):.0f}% below market price, but the Bull Case "
+                    f"(more optimistic growth/margin assumptions) lands close to the market price"
+                    + (f" — the market appears to be pricing in {implied_str}." if implied_str else ".")
+                )
+            else:
+                valuation_category = 'requires_beyond_bull_case'
+                valuation_context = (
+                    f"Even this model's Bull Case values the stock {abs(bull_gap_pct):.0f}% below market price"
+                    + (f", implying the market is pricing in {implied_str} — more aggressive than this model's own Bull Case." if implied_str else ".")
+                    + " That's a sign the price reflects factors a cash-flow DCF can't capture (optionality, new business lines, narrative), not a data error."
+                )
 
         # -----------------------------------------------------------------------
         # STEP 8 — Sensitivity Table: intrinsic value grid (WACC × tier-1 growth)
@@ -1212,21 +1503,34 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
                         row[g]        = _round_to_half(eq_val / shares_f) if shares_f else 0.0
                     sensitivity[round(w, 4)] = row
 
-        return {
+        calculated_at = datetime.now(timezone.utc)
+        result = _sanitize_dcf_value({
+            'model_version':        DCF_MODEL_VERSION,
+            'valuation_date':        calculated_at.date().isoformat(),
+            'calculated_at':         calculated_at.isoformat(),
+            'quote_as_of':           quote_as_of,
+            'fundamentals_period_end': fundamentals_period_end,
             'company_type':          company_type,
             'company_type_label':    company_type_labels[company_type],
             'base_metric_label':     base_metric_label,
             'dcf_method':            dcf_method,
             'sensitivity_mode':      sensitivity_mode,
+            'sector':                sector_raw,
+            'industry':              industry_raw,
+            'market_cap':            market_cap_f,
+            'ebitda':                ebitda_f,
             'base_fcf':              base_fcf,
             'base_revenue':          total_revenue_f,
             'margin_start':          margin_start,
             'margin_target':         margin_target,
             'margin_profile':        margin_profile,
             'projection_horizon_years': 15,
+            'quote_currency':         quote_currency or financial_currency or None,
+            'financial_currency':     financial_currency or quote_currency or None,
             'sbc_ratio':             round(sbc_ratio, 4),
             'stock_based_comp':      round(stock_based_comp, 2),
             'dilution_rate':         round(share_dilution_rate, 4),
+            'net_buyback_rate':      round(net_buyback_rate,    4),
             'fcf_ttm':               fcf_ttm_f,
             'ocf_ttm':               ocf_ttm_f,
             'historical_fcf':        historical_fcf,
@@ -1236,6 +1540,7 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
             'shares_outstanding':    shares_f,
             'current_price':         price_f,
             'beta':                  beta_f,
+            'beta_source':           beta_source,
             'cost_of_equity':        round(cost_of_equity,  4),
             'cost_of_debt':          round(cost_of_debt,    4),
             'eff_tax_rate':          round(eff_tax_rate,    4),
@@ -1252,8 +1557,24 @@ def extract_dcf_data(fundamentals: dict, ticker: str = None, overrides: dict = N
             # FIX I: Market-implied terminal margin for revenue_margin companies
             'market_implied_margin': market_implied_margin,
             'implied_annual_return': implied_annual_return,
+            'valuation_category':    valuation_category,
+            'valuation_context':     valuation_context,
             'sensitivity':           sensitivity,
+        })
+        checksum_payload = {
+            key: value for key, value in result.items()
+            if key not in {'valuation_date', 'calculated_at'}
         }
+        checksum_json = json.dumps(
+            checksum_payload,
+            sort_keys=True,
+            separators=(',', ':'),
+            ensure_ascii=False,
+            allow_nan=False,
+            default=str,
+        )
+        result['calculation_checksum'] = hashlib.sha256(checksum_json.encode('utf-8')).hexdigest()
+        return result
 
     except Exception as e:
         logging.error(f"DCF extraction error for {ticker}: {e}", exc_info=True)

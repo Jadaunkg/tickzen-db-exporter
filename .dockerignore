@@ -1,0 +1,14 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+.venv
+venv
+__pycache__
+*.pyc
+*.log
+generated_data
+logs
+database/logs
+.DS_Store

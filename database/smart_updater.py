@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Smart Stock Data Updater
-=========================
+DEPRECATED: Smart Stock Data Updater
+=====================================
+
+This standalone Supabase updater has been retired. Scheduled stock updates now
+run through ``database/cron_update_runner.py`` and the Azure PostgreSQL export
+workflow. The incremental price/indicator logic is maintained in
+``database/export_to_supabase.py`` because that workflow is currently reused by
+the Azure adapter.
+
+This module is retained temporarily as migration-era source only and must not
+be executed against Supabase.
+
+Original design:
+---------------
 
 Intelligent update system that knows:
 1. Which tables to update daily vs weekly vs monthly
@@ -118,6 +130,11 @@ class SmartStockUpdater:
             supabase_url: Supabase project URL
             supabase_key: Supabase API key
         """
+        raise RuntimeError(
+            "SmartStockUpdater is retired. Use database/cron_update_runner.py "
+            "with the Azure PostgreSQL exporter."
+        )
+
         self.supabase_url = supabase_url or os.getenv('SUPABASE_URL')
         self.supabase_key = supabase_key or os.getenv('SUPABASE_KEY')
         
@@ -434,11 +451,11 @@ class SmartStockUpdater:
             
             # 7. Insert market price snapshot
             logger.info("  [7/12] Inserting market price snapshot...")
-            snapshot_record = self.mapper.map_market_snapshot(
+            snapshot_record = self.mapper.map_market_price_snapshot(
                 stock_id,
+                collected_data['processed_data'],
                 collected_data.get('current_price'),
-                collected_data['info'],
-                collected_data['processed_data']
+                collected_data['info']
             )
             
             self.db.client.table('market_price_snapshot').upsert(
@@ -502,8 +519,14 @@ class SmartStockUpdater:
             )
             
             if insider_records:
-                self.db.client.table('insider_transactions').insert(
-                    insider_records
+                self.db.client.table('insider_transactions').upsert(
+                    insider_records,
+                    on_conflict=(
+                        'stock_id,accession_number,transaction_date,shares_change'
+                        if all(record.get('accession_number') for record in insider_records)
+                        else 'stock_id,insider_name,transaction_date,shares_change'
+                    ),
+                    ignore_duplicates=True,
                 ).execute()
                 result['records_inserted']['insider_transactions'] = len(insider_records )
                 logger.info(f"    ✓ Inserted {len(insider_records)} insider transactions")
@@ -766,7 +789,8 @@ class SmartStockUpdater:
             # 4. sentiment_data (if news available)
             logger.info("  [4/4] Updating sentiment_data...")
             try:
-                news = yf_ticker.news if hasattr(yf_ticker, 'news') else []
+                from data_processing_scripts.data_collection import fetch_ticker_news
+                news = fetch_ticker_news(ticker)
                 if news:
                     sent_record = self.mapper.map_sentiment_data(stock_id, news, info)
                     if sent_record:

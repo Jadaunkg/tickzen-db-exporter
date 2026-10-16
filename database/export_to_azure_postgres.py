@@ -151,13 +151,6 @@ def prepare_bulk_prices(tickers: List[str]):
         logger.info(f"Successfully cached bulk price data for {len(prices_dict)} tickers")
     except Exception as e:
         logger.warning(f"Failed to bulk download prices: {e}. Falling back to individual stock downloads.")
-        msg = str(e)
-        if any(k in msg for k in ['Too Many Requests', 'Rate limited', '429', '401', 'Unauthorized', 'crumb', 'Crumb']):
-            try:
-                from data_processing_scripts.data_collection import _register_rate_limit
-                _register_rate_limit(msg)
-            except Exception:
-                pass
 
 
 def export_multiple_stocks(exporter: AzurePostgresDataExporter, tickers: List[str]) -> Dict:
@@ -210,7 +203,7 @@ Examples:
     )
 
     parser.add_argument("tickers", nargs="*", help="Stock ticker symbols to export")
-    parser.add_argument("--all", action="store_true", help="Export all active tickers from monitored_tickers table (with JSON fallback)")
+    parser.add_argument("--all", action="store_true", help="Export all tickers from stock_tickers_list.json")
     parser.add_argument("--test-connection", action="store_true", help="Only test Azure PostgreSQL connectivity")
     parser.add_argument("--url", help="Full Azure PostgreSQL connection URL")
     parser.add_argument("--host", help="Azure PostgreSQL host")
@@ -220,13 +213,10 @@ Examples:
     parser.add_argument("--port", type=int, help="Azure PostgreSQL port")
     parser.add_argument("--sslmode", help="PostgreSQL SSL mode")
     parser.add_argument("--limit", type=int, help="Limit the number of tickers exported (use with --all)")
-    parser.add_argument("--offset", type=int, default=None, help="Offset to start exporting tickers from (use with --all)")
-    parser.add_argument("--instance-index", type=int, help="Index of this instance (0 to total-instances - 1, overrides env INSTANCE_INDEX)")
-    parser.add_argument("--total-instances", type=int, help="Total number of parallel instances (overrides env TOTAL_INSTANCES)")
-    parser.add_argument("--preview", action="store_true", help="Preview tickers to export without running actual exports")
- 
+    parser.add_argument("--offset", type=int, default=0, help="Offset to start exporting tickers from (use with --all)")
+
     args = parser.parse_args()
- 
+
     if args.test_connection:
         ok = test_connection(
             connection_url=args.url,
@@ -238,9 +228,30 @@ Examples:
             sslmode=args.sslmode,
         )
         sys.exit(0 if ok else 1)
- 
+
     import json
- 
+    tickers = args.tickers
+    if args.all:
+        json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock_tickers_list.json")
+        try:
+            with open(json_path, "r") as f:
+                tickers_data = json.load(f)
+                tickers = tickers_data.get("tickers", [])
+            logger.info(f"Loaded {len(tickers)} tickers from {json_path}")
+            
+            # Apply limit and offset if specified
+            if args.offset > 0:
+                logger.info(f"Applying offset {args.offset} (skipping first {args.offset} tickers)")
+                tickers = tickers[args.offset:]
+            if args.limit is not None and args.limit > 0:
+                logger.info(f"Applying limit {args.limit} (taking first {args.limit} tickers)")
+                tickers = tickers[:args.limit]
+        except Exception as e:
+            parser.error(f"Failed to load stock_tickers_list.json: {e}")
+
+    if not tickers:
+        parser.error("Provide at least one ticker, use --all, or use --test-connection.")
+
     try:
         exporter = AzurePostgresDataExporter(
             connection_url=args.url,
@@ -251,79 +262,14 @@ Examples:
             port=args.port,
             sslmode=args.sslmode,
         )
-    except Exception as error:
-        logger.error(f"Fatal Azure PostgreSQL initialization error: {error}")
-        sys.exit(1)
- 
-    tickers = args.tickers
-    if args.all:
-        db_tickers = []
-        try:
-            res = exporter.db.table('monitored_tickers').select('symbol').eq('is_active', True).execute()
-            if hasattr(res, 'data') and res.data:
-                db_tickers = [r['symbol'].upper() for r in res.data if r.get('symbol')]
-                db_tickers.sort()
-                logger.info(f"Loaded {len(db_tickers)} active tickers from monitored_tickers table.")
-        except Exception as e:
-            logger.warning(f"Could not load tickers from database 'monitored_tickers' table: {e}")
- 
-        if not db_tickers:
-            json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock_tickers_list.json")
-            try:
-                with open(json_path, "r") as f:
-                    tickers_data = json.load(f)
-                    db_tickers = tickers_data.get("tickers", [])
-                seen = set()
-                db_tickers = [x.upper() for x in db_tickers if not (x.upper() in seen or seen.add(x.upper()))]
-                db_tickers.sort()
-                logger.info(f"Loaded {len(db_tickers)} tickers from stock_tickers_list.json (fallback).")
-            except Exception as e:
-                parser.error(f"Failed to load stock_tickers_list.json: {e}")
- 
-        # Resolve slicing parameters from CLI arguments or Environment Variables
-        env_limit = os.getenv("TICKER_BATCH_LIMIT")
-        env_offset = os.getenv("TICKER_BATCH_OFFSET")
-        env_instance_index = os.getenv("INSTANCE_INDEX")
-        env_total_instances = os.getenv("TOTAL_INSTANCES")
- 
-        limit_val = args.limit if args.limit is not None else (int(env_limit) if env_limit else None)
-        offset_val = args.offset if args.offset is not None else (int(env_offset) if env_offset else 0)
-        instance_index = args.instance_index if args.instance_index is not None else (int(env_instance_index) if env_instance_index is not None else None)
-        total_instances = args.total_instances if args.total_instances is not None else (int(env_total_instances) if env_total_instances else 5)
- 
-        # Apply slicing
-        if instance_index is not None:
-            chunk_size = (len(db_tickers) + total_instances - 1) // total_instances
-            start_idx = instance_index * chunk_size
-            end_idx = min(start_idx + chunk_size, len(db_tickers))
-            tickers = db_tickers[start_idx:end_idx]
-            logger.info(f"Partitioning active: Instance {instance_index}/{total_instances} (Slice index {start_idx} to {end_idx}).")
-            logger.info(f"Sliced list to {len(tickers)} tickers for this instance.")
-            run_limit = limit_val if limit_val is not None else len(tickers)
-            tickers = tickers[:run_limit]
-        else:
-            offset_val = max(0, offset_val)
-            tickers = db_tickers[offset_val:]
-            logger.info(f"Direct slicing active: Offset {offset_val}.")
-            run_limit = limit_val if limit_val is not None else len(tickers)
-            tickers = tickers[:run_limit]
-            logger.info(f"Sliced list has {len(tickers)} tickers.")
- 
-    if not tickers:
-        parser.error("Provide at least one ticker, use --all, or use --test-connection.")
- 
-    if args.preview:
-        logger.info(f"Preview mode active. Tickers to export: {tickers}")
-        sys.exit(0)
- 
-    try:
+
         # Download all price data in one bulk request first
         prepare_bulk_prices(tickers)
- 
+
         if len(tickers) == 1:
             result = exporter.export_stock_data(tickers[0])
             sys.exit(0 if result["status"] in ["success", "partial"] else 1)
- 
+
         results = export_multiple_stocks(exporter, tickers)
         sys.exit(0 if results["failed"] == 0 else 1)
     except Exception as error:

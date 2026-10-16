@@ -1,172 +1,59 @@
 #!/usr/bin/env python3
 """
-Prophet Time-Series Forecasting Model
-====================================
+Prophet forecasting model (v2)
+==============================
 
-Advanced time-series forecasting system using Facebook Prophet for stock
-price prediction with seasonal decomposition, trend analysis, and uncertainty
-quantification. Optimized for financial markets with holiday effects and
-volatility modeling.
+Produces a daily median path with an 80% prediction band for a stock's adjusted close, plus the weekly/monthly
+period-end table the rest of the platform consumes.
 
-Core Capabilities:
------------------
-1. **Time-Series Forecasting**: Prophet-based stock price predictions
-2. **Seasonal Decomposition**: Weekly, monthly, yearly pattern analysis
-3. **Trend Analysis**: Long-term trend identification and projection
-4. **Uncertainty Quantification**: Confidence intervals and prediction bounds
-5. **Holiday Effects**: Market holiday impact modeling
-6. **Volatility Modeling**: Advanced volatility forecasting
+What changed from v1 and why
+----------------------------
+v1 fitted Prophet to the raw price with logistic growth (floor 0, cap 2x the historical max), multiplicative
+seasonality and RSI/MACD regressors held at their last 7-day mean.  Walk-forward tests (docs/PROPHET_V2_RESEARCH.md)
+showed that this configuration is significantly worse than simply carrying the last close forward, that its
+"80%" band contained the outcome only 23-44% of the time, that it forecast a collapse to less than half the price
+for 13-15% of cases and that clipping produced exact zero prices (which the exporter then dropped, leaving
+stocks with a truncated forecast).  No Prophet variant fixed this because a price trend carries almost no
+out-of-sample information.
 
-Prophet Model Features:
-----------------------
-- **Additive/Multiplicative Seasonality**: Flexible seasonal modeling
-- **Trend Changepoints**: Automatic trend change detection
-- **Holiday Modeling**: Custom market holiday definitions
-- **Outlier Handling**: Robust outlier detection and treatment
-- **Missing Data**: Automatic handling of missing values
-- **Uncertainty Intervals**: Bayesian uncertainty quantification
+v2 therefore works in log space (a price can never be <= 0), keeps Prophet only as a heavily shrunk,
+bounded trend component (``forecast_core.TREND_WEIGHT``) and derives the bands from the stock's own realised
+volatility, which the backtests show to be calibrated (79-84% coverage at 3/6/12 months).  The maths lives in
+``Models/forecast_core.py`` (pure numpy/pandas); this module handles input cleaning, the optional Prophet fit
+and the report-friendly aggregation.
 
-Financial Market Optimizations:
-------------------------------
-- **Market Hours**: Trading hour awareness for intraday patterns
-- **Market Holidays**: NYSE, NASDAQ holiday calendar integration
-- **Volatility Clustering**: GARCH-like volatility modeling
-- **Regime Detection**: Bull/bear market regime identification
-- **Economic Events**: Macro event impact modeling
+Contract (unchanged for callers)
+--------------------------------
+``train_prophet_model(data, ticker, forecast_horizon, timestamp, macro_data)`` returns
+``(model_or_None, forecast_df, agg_actual, agg_forecast)``:
 
-Model Performance Features:
---------------------------
-- **Cross-Validation**: Time-series cross-validation for performance assessment
-- **Backtesting**: Historical prediction accuracy testing
-- **Model Diagnostics**: Residual analysis and goodness-of-fit metrics
-- **Hyperparameter Tuning**: Automated parameter optimization
+* ``forecast_df``: future business days only - ``ds, yhat, yhat_lower, yhat_upper, trend``
+* ``agg_actual``: recent actual prices, ``Period, Average``
+* ``agg_forecast``: ``Period, Low, Average, High`` at the end of each period (``Average`` is the median/base)
 
-WSL Integration:
----------------
-Supports Windows Subsystem for Linux for enhanced performance:
-- Faster Prophet training on WSL Ubuntu environment
-- Memory optimization for large datasets
-- Parallel processing capabilities
-- Environment variable: USE_WSL_PROPHET=true
-
-Usage Patterns:
---------------
-```python
-# Basic forecasting
-model = ProphetModel()
-model.fit(historical_data)
-forecast = model.predict(periods=30)
-
-# Advanced configuration
-model = ProphetModel(
-    changepoint_prior_scale=0.1,
-    seasonality_prior_scale=10.0,
-    holidays_prior_scale=10.0,
-    add_country_holidays='US'
-)
-
-# With custom seasonalities
-model.add_seasonality(
-    name='monthly',
-    period=30.5,
-    fourier_order=5
-)
-```
-
-Output Format:
--------------
-Forecast DataFrame includes:
-- ds: Date/timestamp
-- yhat: Point forecast
-- yhat_lower: Lower confidence bound
-- yhat_upper: Upper confidence bound
-- trend: Underlying trend component
-- seasonal: Seasonal component
-- holidays: Holiday effect component
-
-Performance Metrics:
--------------------
-- MAE: Mean Absolute Error
-- MAPE: Mean Absolute Percentage Error
-- RMSE: Root Mean Square Error
-- Coverage: Prediction interval coverage
-- Directional Accuracy: Trend direction prediction accuracy
-
-Error Handling:
---------------
-- Data validation and preprocessing
-- Model convergence monitoring
-- Memory usage optimization
-- Graceful degradation for insufficient data
-
-Integration Points:
-------------------
-- Called by automation_scripts/pipeline.py for analysis workflow
-- Used by reporting_tools/report_generator.py for chart creation
-- Integrated with real-time progress tracking via SocketIO
-
-Configuration:
--------------
-Environment Variables:
-- USE_WSL_PROPHET: Enable WSL bridge for performance
-- PROPHET_CACHE_DIR: Cache directory for model artifacts
-- PROPHET_PARALLEL: Enable parallel processing
-
-Author: TickZen Development Team
-Version: 2.3
-Last Updated: January 2026
+The model never raises on a Prophet/CmdStan failure: it falls back to the no-trend forecast and records that in
+the returned frame's ``attrs['trend_component_used']``.  Forecasts are statistical scenarios, not advice.
 """
 
-import platform
 import logging
-import os
 
-# Configure logging
+import numpy as np
+import pandas as pd
+import re
+
+from Models import forecast_core
+
 logger = logging.getLogger(__name__)
+TICKZEN_PROPHET_PIPELINE_VERSION = forecast_core.PIPELINE_VERSION
+FORECAST_BAND_DEFINITION = forecast_core.BAND_DEFINITION
 
-# Check if WSL usage is explicitly enabled via environment variable
-USE_WSL_BRIDGE = os.environ.get('USE_WSL_PROPHET', 'false').lower() == 'true'
-
-# Always try to import native Prophet first (works on Windows with Prophet 1.1+)
 try:
     from prophet import Prophet
-    import pandas as pd
-    import re
-    logger.info("Using native Prophet (direct Windows support)")
     PROPHET_AVAILABLE = True
-except (ImportError, AttributeError) as e:
-    logger.warning(f"Native Prophet not available (may be NumPy compatibility issue): {e}")
+except (ImportError, AttributeError) as e:  # pragma: no cover - environment dependent
+    logger.warning("Prophet is not importable (%s); forecasts will use the no-trend path.", e)
+    Prophet = None
     PROPHET_AVAILABLE = False
-    import pandas as pd
-    import re
-
-# Try to import WSL bridge as backup for Windows CmdStan issues
-WSL_BRIDGE_AVAILABLE = False
-wsl_train_prophet_model = None
-
-if platform.system() == 'Windows':
-    try:
-        # Try relative import first
-        from .wsl_prophet_bridge import train_prophet_model as wsl_train_prophet_model
-        logger.info("WSL Prophet Bridge loaded as fallback option")
-        WSL_BRIDGE_AVAILABLE = True
-    except ImportError:
-        try:
-            # Try absolute import
-            import wsl_prophet_bridge
-            wsl_train_prophet_model = wsl_prophet_bridge.train_prophet_model
-            logger.info("WSL Prophet Bridge loaded as fallback option (absolute import)")
-            WSL_BRIDGE_AVAILABLE = True
-        except ImportError as e:
-            logger.info(f"WSL Prophet Bridge not available: {e}. Will be loaded on demand if needed.")
-
-# Ensure we have at least one Prophet implementation available
-if not PROPHET_AVAILABLE and platform.system() != 'Windows':
-    # On non-Windows systems, require native Prophet
-    raise ImportError("Prophet is not available. Please install: pip install prophet")
-elif not PROPHET_AVAILABLE and platform.system() == 'Windows':
-    # On Windows, we can use WSL bridge as fallback
-    logger.info("Native Prophet unavailable on Windows, will use WSL bridge as needed")
 
 
 # ------------------ Helper Function ------------------
@@ -176,7 +63,7 @@ def parse_time_period(time_period: str) -> int:
     See docstring above.
     """
     time_period = time_period.lower().strip()
-    pattern = r"(\d+)([dwmy])"
+    pattern = r"^(\d+)([dwmy])$"
     match = re.match(pattern, time_period)
     if not match:
         raise ValueError("Invalid time period format. Please use e.g., '3m', '6m', '1y'.")
@@ -193,437 +80,142 @@ def parse_time_period(time_period: str) -> int:
     else:
         raise ValueError("Unsupported time unit. Supported: d, w, m, y.")
 
+
+def _forecast_cadence(forecast_days: int) -> str:
+    """Return the reporting cadence for a calendar-day forecast horizon."""
+    if forecast_days <= 30:
+        return 'daily'
+    if forecast_days <= 90:
+        return 'weekly'
+    return 'monthly'
+
+
+def calendar_horizon_end(last_date, forecast_horizon: str):
+    """Resolve a selected horizon to its actual calendar endpoint."""
+    match = re.fullmatch(r'(\d+)([dwmy])', str(forecast_horizon).lower().strip())
+    if not match:
+        raise ValueError('Invalid forecast horizon.')
+    amount = int(match.group(1))
+    unit = match.group(2)
+    anchor = pd.Timestamp(last_date).normalize()
+    if unit == 'd':
+        return anchor + pd.Timedelta(days=amount)
+    if unit == 'w':
+        return anchor + pd.Timedelta(weeks=amount)
+    if unit == 'm':
+        return anchor + pd.DateOffset(months=amount)
+    return anchor + pd.DateOffset(years=amount)
+
+
+def _business_day_forecast_dates(last_date, forecast_horizon: str):
+    """Weekdays through the selected calendar horizon; exchange holidays are not modeled."""
+    anchor = pd.Timestamp(last_date).normalize()
+    horizon_end = calendar_horizon_end(anchor, forecast_horizon)
+    return pd.bdate_range(start=anchor + pd.Timedelta(days=1), end=horizon_end)
+
+
+def _aggregate_forecast_bands(forecast, cadence: str):
+    """Low / Average / High at the end of each period (see forecast_core.aggregate_period_end)."""
+    return forecast_core.aggregate_period_end(forecast, cadence)
+
+
 # ------------------ Main Training Function ------------------
+def _clean_history(data):
+    if not isinstance(data, pd.DataFrame) or not {'Date', 'Close'}.issubset(data.columns):
+        raise ValueError("Forecast input must contain 'Date' and 'Close' columns.")
+    data = data.copy()
+    data['Date'] = pd.to_datetime(data['Date'], errors='coerce')
+    data['Close'] = pd.to_numeric(data['Close'], errors='coerce')
+    data = data.dropna(subset=['Date', 'Close'])
+    data = data[data['Close'] > 0].drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
+    if data.empty:
+        raise ValueError('Forecast input has no valid positive closing prices.')
+    return data
+
+
 def train_prophet_model(data, ticker='STOCK', forecast_horizon='1y', timestamp=None, macro_data=None):
     """
-    Train a Prophet model for stock price forecasting with a custom forecast horizon.
+    Forecast a stock price path for ``forecast_horizon`` (e.g. '3m', '6m', '1y').
 
     Args:
-        data (pd.DataFrame): Data containing at least the ['Date', 'Close'] columns.
-        ticker (str): Stock ticker for applying ticker-specific parameter tuning.
-        forecast_horizon (str): Forecast period as a string (e.g. '3m', '6m', '1y', '2y').
-        timestamp (optional): Used for report generation.
+        data (pd.DataFrame): at least ``Date`` and ``Close`` (split/dividend-adjusted closes).
+        ticker (str): informational only; v2 uses no per-ticker tuning.
+        forecast_horizon (str): calendar horizon such as '3m', '1y'.
+        timestamp, macro_data: accepted for backward compatibility; unused.
 
     Returns:
-        model (Prophet or None): The fitted model (None if using WSL bridge).
-        forecast (pd.DataFrame): Forecasted results.
-        agg_actual (pd.DataFrame): Aggregated actual data.
-        agg_forecast (pd.DataFrame): Aggregated forecast data.
+        (model or None, forecast, agg_actual, agg_forecast) - see the module docstring.
     """
-    # Try native Prophet first, fall back to WSL on Windows CmdStan errors or NumPy issues
-    if PROPHET_AVAILABLE:
-        try:
-            # Use native Prophet (default)
-            return _train_prophet_model_native(data, ticker, forecast_horizon, timestamp, macro_data)
-        except RuntimeError as e:
-            # Check if this is a Windows CmdStan error (signal 3221225657 or optimization error)
-            error_msg = str(e).lower()
-            if (platform.system() == 'Windows' and 
-                ('terminated by signal' in error_msg or 'error during optimization' in error_msg)):
-                logger.warning(f"Native Prophet failed on Windows (CmdStan error): {e}")
-                logger.info("Attempting fallback to WSL Prophet Bridge...")
-                # Try WSL bridge as fallback
-                return _train_prophet_model_wsl(data, ticker, forecast_horizon, timestamp, macro_data)
-            else:
-                # Re-raise other types of errors
-                raise
-        except (AttributeError, ImportError) as e:
-            # Handle NumPy compatibility or other import errors
-            if platform.system() == 'Windows':
-                logger.warning(f"Native Prophet failed (compatibility issue): {e}. Trying WSL fallback...")
-                return _train_prophet_model_wsl(data, ticker, forecast_horizon, timestamp, macro_data)
-            else:
-                raise
-        except Exception as e:
-            # Log other exceptions but still try WSL fallback on Windows
-            if platform.system() == 'Windows':
-                logger.warning(f"Native Prophet failed: {e}. Trying WSL fallback...")
-                return _train_prophet_model_wsl(data, ticker, forecast_horizon, timestamp, macro_data)
-            else:
-                raise
-    else:
-        # Use WSL bridge if native Prophet not available (NumPy 2.0 compatibility issue)
-        logger.info("Native Prophet unavailable, using WSL bridge")
-        return _train_prophet_model_wsl(data, ticker, forecast_horizon, timestamp, macro_data)
+    cleaned = _clean_history(data)
+    return _train_prophet_model_native(cleaned, ticker, forecast_horizon, timestamp, macro_data)
 
-def _train_prophet_model_wsl(data, ticker='STOCK', forecast_horizon='1y', timestamp=None, macro_data=None):
-    """
-    Train Prophet model using WSL bridge
-    """
-    global wsl_train_prophet_model, WSL_BRIDGE_AVAILABLE
-    
-    # Load WSL bridge if not already loaded
-    if not WSL_BRIDGE_AVAILABLE or wsl_train_prophet_model is None:
-        try:
-            # Try relative import first
-            from .wsl_prophet_bridge import train_prophet_model as wsl_train_prophet_model
-            logger.info("Loaded WSL Prophet Bridge on demand")
-            WSL_BRIDGE_AVAILABLE = True
-        except ImportError:
-            try:
-                # Try absolute import
-                import wsl_prophet_bridge
-                wsl_train_prophet_model = wsl_prophet_bridge.train_prophet_model
-                logger.info("Loaded WSL Prophet Bridge on demand (absolute import)")
-                WSL_BRIDGE_AVAILABLE = True
-            except ImportError as e:
-                raise RuntimeError(f"WSL Prophet Bridge is required but not available: {e}")
-    
-    # ----- Preliminary Check and Basic Preprocessing -----
-    required_columns = ['Date', 'Close']
-    missing_columns = [col for col in required_columns if col not in data.columns]
-    if missing_columns:
-        raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
 
-    # Ensure date is in proper format.
-    data['Date'] = pd.to_datetime(data['Date'], errors='coerce')
-    data = data.dropna(subset=['Date'])
-
-    # ----- Parameter Tuning for Different Tickers -----
-    ticker_params = {
-        'TSLA': {
-            'cap_multiplier': 2.5,
-            'changepoint_prior_scale': 0.05,
-            'seasonality_mode': 'multiplicative'
-        },
-        'AAPL': {
-            'cap_multiplier': 2.0,
-            'changepoint_prior_scale': 0.1,
-            'seasonality_mode': 'multiplicative'
-        }
-    }
-    params = ticker_params.get(ticker, {
-        'cap_multiplier': 2.0,
-        'changepoint_prior_scale': 0.08,
-        'seasonality_mode': 'multiplicative'
-    })
-    cap_multiplier = params['cap_multiplier']
-    changepoint_prior_scale = params['changepoint_prior_scale']
-    seasonality_mode = params['seasonality_mode']
-
-    # ----- Dynamic Cap Calculation -----
-    max_price = data['Close'].max() * cap_multiplier
-    data['cap'] = max_price
-    data['floor'] = 0
-
-    # ----- Prepare Data for Prophet -----
-    df = data.rename(columns={'Date': 'ds', 'Close': 'y'})
-    df['ds'] = pd.to_datetime(df['ds'])
-    df['cap'] = max_price
-    df['floor'] = 0
-
-    # ----- Model Parameters for WSL -----
-    model_params = {
-        'growth': 'logistic',
-        'yearly_seasonality': True,
-        'weekly_seasonality': True,
-        'changepoint_prior_scale': changepoint_prior_scale,
-        'seasonality_mode': seasonality_mode,
-        'uncertainty_samples': 5
-    }
-
-    # ----- Add Regressors if Present -----
-    regressor_features = ['RSI', 'MACD', 'Interest_Rate']
-    available_regressors = [feature for feature in regressor_features if feature in df.columns]
-
-    # ----- Convert Forecast Horizon (String) to Days -----
-    forecast_days = parse_time_period(forecast_horizon)
-
-    # ----- Use WSL Bridge -----
+def _fit_prophet_trend(history, future_dates):
+    """Prophet log-linear trend -> (fitted model, log move vs today per future date), or (None, None) on any failure."""
+    if not PROPHET_AVAILABLE or forecast_core.TREND_WEIGHT <= 0:
+        return None, None
     try:
-        model, forecast, actual_df = wsl_train_prophet_model(df, model_params, forecast_days, available_regressors)
-        logger.info("Successfully trained Prophet model using WSL bridge")
-    except Exception as e:
-        logger.error(f"WSL Prophet training failed: {e}")
-        raise
+        logging.getLogger('cmdstanpy').setLevel(logging.WARNING)
+        logging.getLogger('prophet').setLevel(logging.WARNING)
+        frame = pd.DataFrame({'ds': history['Date'].values, 'y': np.log(history['Close'].astype(float).values)})
+        model = Prophet(
+            growth='linear',
+            yearly_seasonality=False,
+            weekly_seasonality=False,
+            daily_seasonality=False,
+            changepoint_prior_scale=0.01,
+            uncertainty_samples=0,
+        )
+        model.fit(frame)
+        predicted = model.predict(pd.DataFrame({'ds': list(frame['ds']) + list(future_dates)}))
+        fitted_today = float(predicted['yhat'].iloc[len(frame) - 1])
+        deviation = predicted['yhat'].iloc[len(frame):].to_numpy(dtype=float) - fitted_today
+        if not np.isfinite(deviation).all():
+            return None, None
+        return model, deviation
+    except Exception as exc:  # CmdStan missing/crashing must never take the forecast down
+        logger.warning("Prophet trend component unavailable (%s); using the no-trend forecast.", exc)
+        return None, None
 
-    # ----- Post-process Predictions -----
-    forecast['yhat'] = forecast['yhat'].clip(lower=0)
-    forecast['yhat_lower'] = forecast['yhat_lower'].clip(lower=0)
-    forecast['yhat_upper'] = forecast['yhat_upper'].clip(lower=0)
 
-    # ----- Aggregate Data for Reporting -----
-    last_date = df['ds'].max()
-    current_date = pd.Timestamp.now()
+def _aggregate_actuals(df, last_date, cadence):
+    """Recent actual prices on the same period grid as the forecast table."""
+    if cadence == 'daily':
+        recent = df[df['ds'] >= last_date - pd.Timedelta(days=15)].copy()
+        recent['Period'] = recent['ds'].dt.strftime('%Y-%m-%d')
+        out = recent.groupby('Period').agg({'y': 'mean'}).reset_index()
+        return out.rename(columns={'y': 'Average'})
+    if cadence == 'weekly':
+        recent = df[df['ds'] >= last_date - pd.DateOffset(months=3)].copy()
+        recent['Period'] = recent['ds'].dt.to_period('W-SUN').dt.start_time.dt.strftime('%Y-%m-%d')
+        out = recent.groupby('Period', as_index=False)['y'].mean()
+        return out.rename(columns={'y': 'Average'})
+    recent = df[df['ds'] >= last_date - pd.DateOffset(months=8)].copy()
+    recent['Period'] = recent['ds'].dt.to_period('M').dt.strftime('%Y-%m')
+    current_month = last_date.to_period('M').strftime('%Y-%m')
+    rows = []
+    for period, group in recent.groupby('Period'):
+        # the current month is partial: show the latest price, not a month-to-date average
+        rows.append({'Period': period, 'Average': group['y'].iloc[-1] if period == current_month else group['y'].mean()})
+    return pd.DataFrame(rows, columns=['Period', 'Average'])
 
-    # Choose aggregation frequency based on forecast period
-    if forecast_days <= 30:
-        start_date = last_date - pd.Timedelta(days=15)
-        agg_format = 'daily'
-        df_recent = df[df['ds'] >= start_date].copy()
-        df_recent['Period'] = df_recent['ds'].dt.strftime('%Y-%m-%d')
-    elif forecast_days <= 90:
-        start_date = last_date - pd.DateOffset(months=3)
-        agg_format = 'weekly'
-        df_recent = df[df['ds'] >= start_date].copy()
-        df_recent = df_recent.set_index('ds').resample('W').mean().reset_index()
-        df_recent['Period'] = df_recent['ds'].dt.strftime('%Y-%m-%d')
-    else:
-        start_date = last_date - pd.DateOffset(months=8)
-        agg_format = 'monthly'
-        df_recent = df[df['ds'] >= start_date].copy()
-        df_recent['Period'] = df_recent['ds'].dt.to_period('M').dt.strftime('%Y-%m')
-
-    # Aggregate actual historical prices with special handling for current month
-    if agg_format == 'monthly':
-        # For monthly aggregation, handle current month specially
-        current_month = current_date.to_period('M').strftime('%Y-%m')
-
-        # Group by period and calculate aggregates
-        period_groups = df_recent.groupby('Period')
-
-        agg_data = []
-        for period, group in period_groups:
-            if period == current_month:
-                # For current month, use the most recent price instead of average
-                latest_price = group['y'].iloc[-1]  # Most recent price in current month
-                agg_data.append({'Period': period, 'Average': latest_price})
-            else:
-                # For past months, use average
-                avg_price = group['y'].mean()
-                agg_data.append({'Period': period, 'Average': avg_price})
-
-        agg_actual = pd.DataFrame(agg_data)
-    else:
-        # For daily/weekly, use regular aggregation
-        agg_actual = df_recent.groupby('Period').agg({'y': 'mean'}).reset_index()
-        agg_actual.rename(columns={'y': 'Average'}, inplace=True)
-
-    # Aggregate the forecasted data.
-    forecast_future = forecast[forecast['ds'] >= last_date].copy()
-    if agg_format == 'daily':
-        forecast_future['Period'] = forecast_future['ds'].dt.strftime('%Y-%m-%d')
-    elif agg_format == 'weekly':
-        forecast_future = forecast_future.set_index('ds').resample('W').mean().reset_index()
-        forecast_future['Period'] = forecast_future['ds'].dt.strftime('%Y-%m-%d')
-    else:  # monthly
-        forecast_future['Period'] = forecast_future['ds'].dt.to_period('M').dt.strftime('%Y-%m')
-
-    # Use meaningful aggregation: lower bound = mean - std_dev of yhat, upper = mean + std_dev
-    # This avoids the 0 floor issue while maintaining reasonable confidence intervals
-    agg_data = []
-    for period, group in forecast_future.groupby('Period'):
-        mean_forecast = group['yhat'].mean()
-        std_forecast = group['yhat'].std()
-        
-        # Calculate bounds with std deviation
-        lower_bound = max(0, mean_forecast - std_forecast)  # Keep >= 0 for stock prices
-        upper_bound = mean_forecast + std_forecast
-        
-        agg_data.append({
-            'Period': period,
-            'Low': lower_bound,
-            'Average': mean_forecast,
-            'High': upper_bound
-        })
-    
-    agg_forecast = pd.DataFrame(agg_data)
-
-    # CALIBRATION: Apply confidence interval widening to achieve ~70% coverage
-    # Calibration factors determined from backtesting against 18 stocks:
-    # - Low volatility (<2%): 1.65x scaling
-    # - Medium volatility (2-5%): 1.51x scaling  
-    # - High volatility (>5%): 1.29x scaling
-    # Result: Achieves 61.6% → 70% target coverage with 1.55x average scaling
-    if len(df) >= 100:
-        # Calculate historical volatility to determine calibration factor
-        returns = df['y'].pct_change().dropna()
-        volatility = returns.std() * 100 if len(returns) > 0 else 0
-        
-        # Select calibration factor by volatility tier
-        if volatility < 2.0:
-            calibration_factor = 1.55  # Low volatility needs more widening
-        elif volatility < 5.0:
-            calibration_factor = 1.48  # Medium volatility
-        else:
-            calibration_factor = 1.30  # High volatility already has wider intervals
-        
-        # Apply calibration to improve coverage
-        for idx in agg_forecast.index:
-            midpoint = agg_forecast.loc[idx, 'Average']
-            current_width = agg_forecast.loc[idx, 'High'] - agg_forecast.loc[idx, 'Low']
-            new_width = current_width * calibration_factor
-            
-            agg_forecast.loc[idx, 'Low'] = max(midpoint * 0.45, midpoint - new_width / 2)
-            agg_forecast.loc[idx, 'High'] = midpoint + new_width / 2
-
-    # Smooth the transition: set the first forecast period equal to last actual average.
-    if not agg_actual.empty and not agg_forecast.empty:
-        last_actual_value = agg_actual['Average'].iloc[-1]
-        agg_forecast.loc[agg_forecast.index[0], ['Low', 'Average', 'High']] = last_actual_value
-
-    return model, forecast, agg_actual, agg_forecast
 
 def _train_prophet_model_native(data, ticker='STOCK', forecast_horizon='1y', timestamp=None, macro_data=None):
-    """
-    Train Prophet model using native implementation (original code)
-    """
-    # ----- Preliminary Check and Basic Preprocessing -----
-    required_columns = ['Date', 'Close']
-    missing_columns = [col for col in required_columns if col not in data.columns]
-    if missing_columns:
-        raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
-    
-    # Ensure date is in proper format.
-    data['Date'] = pd.to_datetime(data['Date'], errors='coerce')
-    data = data.dropna(subset=['Date'])
-
-    # ----- Parameter Tuning for Different Tickers -----
-    ticker_params = {
-        'TSLA': {
-            'cap_multiplier': 2.5,
-            'changepoint_prior_scale': 0.05,
-            'seasonality_mode': 'multiplicative'
-        },
-        'AAPL': {
-            'cap_multiplier': 2.0,
-            'changepoint_prior_scale': 0.1,
-            'seasonality_mode': 'multiplicative'
-        }
-    }
-    params = ticker_params.get(ticker, {
-        'cap_multiplier': 2.0,
-        'changepoint_prior_scale': 0.08,
-        'seasonality_mode': 'multiplicative'
-    })
-    cap_multiplier = params['cap_multiplier']
-    changepoint_prior_scale = params['changepoint_prior_scale']
-    seasonality_mode = params['seasonality_mode']
-
-    # ----- Dynamic Cap Calculation -----
-    max_price = data['Close'].max() * cap_multiplier
-    data['cap'] = max_price
-    data['floor'] = 0
-
-    # ----- Prepare Data for Prophet -----
-    df = data.rename(columns={'Date': 'ds', 'Close': 'y'})
+    """Build the v2 forecast from already-cleaned history."""
+    cleaned = _clean_history(data)
+    df = cleaned.rename(columns={'Date': 'ds', 'Close': 'y'})[['ds', 'y']].copy()
     df['ds'] = pd.to_datetime(df['ds'])
-    df['cap'] = max_price
-    df['floor'] = 0
-
-    # ----- Initialize Prophet Model -----
-    model = Prophet(
-        growth='logistic',
-        yearly_seasonality=True,
-        weekly_seasonality=True,
-        changepoint_prior_scale=changepoint_prior_scale,
-        seasonality_mode=seasonality_mode,
-        uncertainty_samples=5
-    )
-
-    # ----- Add Regressors if Present -----
-    regressor_features = ['RSI', 'MACD', 'Interest_Rate']
-    for feature in regressor_features:
-        if feature in df.columns:
-            model.add_regressor(feature)
-
-    # ----- Fit the Model on Historical Data -----
-    model.fit(df)
-
-    # ----- Convert Forecast Horizon (String) to Days -----
-    forecast_days = parse_time_period(forecast_horizon)
-    
-    # ----- Create Future DataFrame -----
-    future = model.make_future_dataframe(periods=forecast_days)
-    future['cap'] = max_price
-    future['floor'] = 0
-
-    # ----- Set Future Regressor Values -----
-    for feature in regressor_features:
-        if feature in df.columns:
-            if len(df) >= 7:
-                future[feature] = df[feature].iloc[-7:].mean()
-            else:
-                future[feature] = df[feature].iloc[-1]
-
-    # ----- Forecast and Post-process Predictions -----
-    forecast = model.predict(future)
-    forecast['yhat'] = forecast['yhat'].clip(lower=0)
-    forecast['yhat_lower'] = forecast['yhat_lower'].clip(lower=0)
-    forecast['yhat_upper'] = forecast['yhat_upper'].clip(lower=0)
-
-    # ----- Aggregate Data for Reporting with Custom Grouping -----
     last_date = df['ds'].max()
-    current_date = pd.Timestamp.now()
-    
-    # Choose aggregation frequency based on forecast period
-    if forecast_days <= 30:
-        # Daily grouping: use last 15 days (for example) from historical data
-        start_date = last_date - pd.Timedelta(days=15)
-        agg_format = 'daily'
-        df_recent = df[df['ds'] >= start_date].copy()
-        df_recent['Period'] = df_recent['ds'].dt.strftime('%Y-%m-%d')
-    elif forecast_days <= 90:
-        # Weekly grouping: use roughly last 3 months
-        start_date = last_date - pd.DateOffset(months=3)
-        agg_format = 'weekly'
-        df_recent = df[df['ds'] >= start_date].copy()
-        df_recent = df_recent.set_index('ds').resample('W').mean().reset_index()
-        df_recent['Period'] = df_recent['ds'].dt.strftime('%Y-%m-%d')
-    else:
-        # Monthly grouping: use roughly last 8 months
-        start_date = last_date - pd.DateOffset(months=8)
-        agg_format = 'monthly'
-        df_recent = df[df['ds'] >= start_date].copy()
-        df_recent['Period'] = df_recent['ds'].dt.to_period('M').dt.strftime('%Y-%m')
 
-    # Aggregate actual historical prices with special handling for current month
-    if agg_format == 'monthly':
-        # For monthly aggregation, handle current month specially
-        current_month = current_date.to_period('M').strftime('%Y-%m')
+    forecast_days = parse_time_period(forecast_horizon)
+    future_dates = _business_day_forecast_dates(last_date, forecast_horizon)
+    if len(future_dates) == 0:
+        raise ValueError('Forecast horizon contains no business days.')
 
-        # Group by period and calculate aggregates
-        period_groups = df_recent.groupby('Period')
+    model, deviation = _fit_prophet_trend(cleaned, future_dates)
+    forecast = forecast_core.project_paths(cleaned.set_index('Date')['Close'], future_dates, deviation)
 
-        agg_data = []
-        for period, group in period_groups:
-            if period == current_month:
-                # For current month, use the most recent price instead of average
-                latest_price = group['y'].iloc[-1]  # Most recent price in current month
-                agg_data.append({'Period': period, 'Average': latest_price})
-            else:
-                # For past months, use average
-                avg_price = group['y'].mean()
-                agg_data.append({'Period': period, 'Average': avg_price})
-
-        agg_actual = pd.DataFrame(agg_data)
-    else:
-        # For daily/weekly, use regular aggregation
-        agg_actual = df_recent.groupby('Period').agg({'y': 'mean'}).reset_index()
-        agg_actual.rename(columns={'y': 'Average'}, inplace=True)
-
-    # Similarly, aggregate the forecasted data.
-    forecast_future = forecast[forecast['ds'] >= last_date].copy()
-    if agg_format == 'daily':
-        forecast_future['Period'] = forecast_future['ds'].dt.strftime('%Y-%m-%d')
-    elif agg_format == 'weekly':
-        forecast_future = forecast_future.set_index('ds').resample('W').mean().reset_index()
-        forecast_future['Period'] = forecast_future['ds'].dt.strftime('%Y-%m-%d')
-    else:  # monthly
-        forecast_future['Period'] = forecast_future['ds'].dt.to_period('M').dt.strftime('%Y-%m')
-
-    # Use percentile-based aggregation for confidence bounds (avoids 0 floor issue)
-    agg_forecast = forecast_future.groupby('Period').agg({
-        'yhat_lower': lambda x: x.quantile(0.1),  # 10th percentile for lower bound
-        'yhat': 'mean',                            # Mean for average forecast
-        'yhat_upper': lambda x: x.quantile(0.9)   # 90th percentile for upper bound
-    }).reset_index()
-    agg_forecast.rename(columns={
-        'yhat_lower': 'Low',
-        'yhat': 'Average',
-        'yhat_upper': 'High'
-    }, inplace=True)
-    # Ensure the low boundary doesn't drop below 45% of the midpoint to keep lower bounds realistic
-    agg_forecast['Low'] = agg_forecast.apply(lambda r: max(r['Average'] * 0.45, r['Low']), axis=1)
-    
-    # Smooth the transition: set the first forecast period equal to last actual average.
-    if not agg_actual.empty and not agg_forecast.empty:
-        last_actual_value = agg_actual['Average'].iloc[-1]
-        agg_forecast.loc[agg_forecast.index[0], ['Low', 'Average', 'High']] = last_actual_value
-
-    # ----- Prepare Historical Data for Report Generation -----
-    historical_data = data.copy()
-    historical_data['Date'] = pd.to_datetime(historical_data['Date'])
-
-
+    cadence = _forecast_cadence(forecast_days)
+    agg_actual = _aggregate_actuals(df, last_date, cadence)
+    agg_forecast = _aggregate_forecast_bands(forecast, cadence)
     return model, forecast, agg_actual, agg_forecast

@@ -36,7 +36,7 @@ Core Sentiment Sources:
 Sentiment Analysis Techniques:
 -----------------------------
 - **Natural Language Processing (NLP)**:
-  - TextBlob polarity and subjectivity analysis
+  - VADER compound-polarity analysis for news headlines
   - VADER sentiment analysis for social media
   - Custom financial lexicon-based scoring
   - Named entity recognition for company mentions
@@ -146,7 +146,7 @@ Last Updated: January 2026
 
 import pandas as pd
 import numpy as np
-from textblob import TextBlob
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import yfinance as yf
 from datetime import datetime, timedelta
 
@@ -154,6 +154,7 @@ class SentimentAnalyzer:
     """Advanced sentiment analysis for market sentiment tracking"""
     
     def __init__(self):
+        self._headline_analyzer = SentimentIntensityAnalyzer()
         self.sentiment_weights = {
             'news': 0.4,
             'analyst': 0.3,
@@ -181,8 +182,7 @@ class SentimentAnalyzer:
                     text_content = headline.get('title', '') or headline.get('content', '') or headline.get('headline', '')
             
             if text_content and isinstance(text_content, str):
-                blob = TextBlob(text_content)
-                sentiments.append(blob.sentiment.polarity)
+                sentiments.append(self._headline_analyzer.polarity_scores(text_content)['compound'])
         
         if not sentiments:
             return {'score': 0, 'classification': 'neutral', 'confidence': 0, 'sample_size': 0}

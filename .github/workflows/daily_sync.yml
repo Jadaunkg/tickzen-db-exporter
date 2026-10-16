@@ -1,19 +1,25 @@
-name: Daily Stock Data Sync
+name: Manual Stock Data Sync
+
+# The scheduled daily update runs on Azure (deploy/azure/deploy_container_apps_job.sh).
+# This workflow is a manual fallback only: it runs one batch from a GitHub runner.
+# Needs repository secrets AZURE_POSTGRES_HOST, AZURE_POSTGRES_DB, AZURE_POSTGRES_USER,
+# AZURE_POSTGRES_PASSWORD, FINNHUB_API_KEY and FRED_API_KEY.
 
 on:
-  schedule:
-    # Runs daily at 21:00 UTC (Which is 2:30 AM IST, after market close)
-    - cron: '0 21 * * *'
-  workflow_dispatch: # Allows you to manually trigger the sync from GitHub UI at any time
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Stocks to process in this batch"
+        default: "70"
+      preview:
+        description: "Only list the next batch, export nothing"
+        type: boolean
+        default: true
 
 jobs:
   sync-stocks:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        # Spins up 5 instances running in parallel
-        instance_index: [0, 1, 2, 3, 4]
-      fail-fast: false
+    timeout-minutes: 180
 
     steps:
     - name: Checkout repository
@@ -22,7 +28,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        python-version: '3.11'
         cache: 'pip'
 
     - name: Install dependencies
@@ -30,21 +36,16 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Run Database Sync Batch
+    - name: Run one batch
       env:
-        DB_TYPE: azure
-        # Secure credentials loaded from GitHub Secrets
-        AZURE_POSTGRES_URL: ${{ secrets.AZURE_POSTGRES_URL }}
-        # Load unique Finnhub key for each of the 5 instances
-        FINNHUB_API_KEY: ${{ secrets[format('FINNHUB_API_KEY_{0}', matrix.instance_index)] }}
+        TZ: Asia/Kolkata
+        AZURE_POSTGRES_HOST: ${{ secrets.AZURE_POSTGRES_HOST }}
+        AZURE_POSTGRES_PORT: "5432"
+        AZURE_POSTGRES_DB: ${{ secrets.AZURE_POSTGRES_DB }}
+        AZURE_POSTGRES_USER: ${{ secrets.AZURE_POSTGRES_USER }}
+        AZURE_POSTGRES_PASSWORD: ${{ secrets.AZURE_POSTGRES_PASSWORD }}
+        AZURE_POSTGRES_SSLMODE: require
+        FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-        
-        # Batch size and throttling sleep
-        SUB_BATCH_SIZE: 70
-        BATCH_SLEEP_SECONDS: 4200
-        
-        # Slicing parameters for this matrix job
-        INSTANCE_INDEX: ${{ matrix.instance_index }}
-        TOTAL_INSTANCES: 5
       run: |
-        python database/cron_update_runner.py --once --force
+        python database/cron_update_runner.py --force --limit "${{ inputs.limit }}" ${{ inputs.preview && '--preview' || '' }}

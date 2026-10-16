@@ -241,6 +241,22 @@ CREATE TABLE forecast_data (
     forecast_avg_price NUMERIC(15, 4),
     forecast_range_width NUMERIC(15, 4),
     forecast_period VARCHAR(50),
+    period_end DATE,
+    low_price NUMERIC(15, 4),
+    base_price NUMERIC(15, 4),
+    high_price NUMERIC(15, 4),
+    model_version VARCHAR(100),
+    generated_at TIMESTAMP WITH TIME ZONE,
+    model_name VARCHAR(100),
+    source_class VARCHAR(100),
+    training_start_date DATE,
+    training_cutoff_date DATE,
+    input_series TEXT,
+    adjustment_policy TEXT,
+    band_definition TEXT,
+    anchor_price NUMERIC(15, 4),
+    anchor_as_of DATE,
+    horizon_basis VARCHAR(80),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(stock_id, forecast_date, forecast_period)
@@ -313,12 +329,23 @@ CREATE TABLE insider_transactions (
     shares_change BIGINT,
     transaction_price NUMERIC(15, 4),
     estimated_value NUMERIC(20, 2),
+    accession_number TEXT,
+    filing_date DATE,
+    transaction_code VARCHAR(8),
+    transaction_type VARCHAR(24),
+    is_economic_transaction BOOLEAN NOT NULL DEFAULT TRUE,
+    ownership_type VARCHAR(24),
+    ownership_after NUMERIC(20, 4),
+    ownership_change NUMERIC(20, 4),
+    source_url TEXT,
+    retrieved_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_insider_stock_date ON insider_transactions(stock_id, transaction_date DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_insider_unique ON insider_transactions(stock_id, insider_name, transaction_date, shares_change);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_insider_accession_unique ON insider_transactions(stock_id, accession_number, transaction_date, shares_change);
 
 -- ============================================================================
 -- LIQUIDITY_RISK_DATA
@@ -719,8 +746,19 @@ CREATE TRIGGER update_stock_news_data_updated_at BEFORE UPDATE ON stock_news_dat
 -- ============================================================================
 """
 
-def execute_schema_on_azure():
-    """Execute the complete schema on Azure PostgreSQL."""
+def execute_schema_on_azure(*, allow_destructive: bool = False):
+    """Bootstrap a disposable database only.
+
+    This historical script contains ``DROP TABLE`` statements and is not a
+    production migration runner. Production changes belong in
+    ``database/migrations``.
+    """
+    if not allow_destructive:
+        raise RuntimeError(
+            "Destructive schema bootstrap refused. Use reviewed forward migrations in "
+            "database/migrations. For an isolated disposable database only, set "
+            "TICKZEN_ALLOW_DESTRUCTIVE_TEST_BOOTSTRAP=1."
+        )
     
     logger.info("=" * 80)
     logger.info("AZURE DATABASE SCHEMA SETUP")
@@ -796,5 +834,7 @@ def execute_schema_on_azure():
                 pass
 
 if __name__ == "__main__":
-    success = execute_schema_on_azure()
+    success = execute_schema_on_azure(
+        allow_destructive=os.getenv("TICKZEN_ALLOW_DESTRUCTIVE_TEST_BOOTSTRAP") == "1"
+    )
     sys.exit(0 if success else 1)

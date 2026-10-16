@@ -163,6 +163,33 @@ import pytz
 
 from data_processing_scripts.date_utils import normalize_date_column, normalize_date_series
 
+# yfinance's TickerBase.get_info() has no cross-instance cache - every module
+# that does `yf.Ticker(symbol).info` (data_collection.py, peer_comparison.py,
+# risk_analysis.py, dcf_valuation.py, technical_analysis.py, auto_publisher.py)
+# creates a fresh Ticker object and triggers a brand new network call, even
+# when several of them run within the same report for the same symbol.
+# Profiled directly: a single report generation called .info 10 separate
+# times for one ticker, ~500ms each (5s total) for data that doesn't change
+# within that window. This module is the common import point for anything
+# that touches yfinance, so patching here covers all of them with one cache.
+_yf_info_cache: dict = {}
+_YF_INFO_CACHE_TTL_SECONDS = 300  # long enough to cover one report's many calls, short enough to never serve stale data across separate report runs
+
+_original_yf_get_info = yf.Ticker.get_info
+
+def _cached_yf_get_info(self):
+    symbol = getattr(self, "ticker", None)
+    if symbol:
+        cached = _yf_info_cache.get(symbol)
+        if cached is not None and (time.time() - cached[1]) < _YF_INFO_CACHE_TTL_SECONDS:
+            return cached[0]
+    result = _original_yf_get_info(self)
+    if symbol and result:
+        _yf_info_cache[symbol] = (result, time.time())
+    return result
+
+yf.Ticker.get_info = _cached_yf_get_info
+
 # Import real-time configuration
 try:
     from config.realtime_config import get_realtime_config, is_realtime_enabled
@@ -239,6 +266,29 @@ def _yf_download(**kwargs):
         except Exception:
             pass
     return yf.download(**kwargs)
+
+
+NEWS_COUNT = 20
+
+
+def fetch_ticker_news(ticker, count=NEWS_COUNT):
+    """Latest headlines tagged with ``ticker``: one Yahoo search request through the shared limiter.
+
+    Use this instead of yfinance's ``Ticker.news``: that posts to Yahoo's /xhr/ncp endpoint, which has answered
+    404 since late September 2026, and yfinance turns the 404 into an empty list without an error. The search
+    endpoint returns the same articles as flat dicts (title, publisher, link, providerPublishTime,
+    relatedTickers, thumbnail). Only articles Yahoo tags with the symbol are kept.
+    """
+    from earnings_reports.earnings_history import yahoo_call
+
+    symbol = str(ticker).strip().upper()
+    search = yahoo_call(lambda: yf.Search(symbol, max_results=0, news_count=count, lists_count=0,
+                                          include_cb=False, recommended=0))
+    return [
+        article for article in (search.news or [])
+        if isinstance(article, dict)
+        and symbol in {str(t).upper() for t in (article.get('relatedTickers') or [])}
+    ]
 
 
 def _set_last_fetch_error(ticker, error_type, message=""):
@@ -767,24 +817,11 @@ def fetch_stock_data(
                 info = yf_ticker.info
 
                 if not info or not info.get('symbol') or info.get('regularMarketPrice') is None:
-                    # Distinguish between delisted/invalid stock and a rate limit block by attempting a history fetch
-                    try:
-                        # If rate limited, this will raise an exception (YFRateLimitError or HTTPError)
-                        hist_check = yf_ticker.history(period="1d", raise_errors=True)
-                    except Exception as hist_err:
-                        # Raise to be caught by the outer attempt loop exception handler (which registers rate limit)
-                        raise hist_err
-
-                    if hist_check is None or hist_check.empty:
-                        logger.error(
-                            f"Ticker {ticker} appears invalid/unavailable (missing symbol/regularMarketPrice in info, and no history data)."
-                        )
-                        _set_last_fetch_error(ticker, 'invalid_or_unavailable', 'Ticker info missing symbol/regularMarketPrice and history empty')
-                        return None
-
-                    # History fetch succeeded with real data, so the ticker is valid -
-                    # the info payload was just momentarily incomplete. Proceed with the normal download below.
-                    logger.info(f"Ticker {ticker} info payload was incomplete but history fetch succeeded; proceeding with historical download.")
+                    logger.error(
+                        f"Ticker {ticker} appears invalid/unavailable (missing symbol/regularMarketPrice in info)."
+                    )
+                    _set_last_fetch_error(ticker, 'invalid_or_unavailable', 'Ticker info missing symbol/regularMarketPrice')
+                    return None
 
                 download_params = {
                     'tickers': ticker,
@@ -850,7 +887,7 @@ def fetch_stock_data(
 
             except Exception as e:
                 msg = str(e)
-                is_rate_limited = any(k in msg.lower() for k in ['too many requests', 'rate limited', '429', '401', 'unauthorized', 'crumb'])
+                is_rate_limited = ('Too Many Requests' in msg) or ('Rate limited' in msg)
                 if is_rate_limited:
                     cooldown, strikes = _register_rate_limit(msg)
                     logger.error(
@@ -1012,13 +1049,8 @@ def get_current_market_price(ticker, timeout=10):
         
     except Exception as e:
         logger.error(f"Error getting current price for {ticker}: {e}")
-        msg = str(e)
-        if any(k in msg.lower() for k in ['too many requests', 'rate limited', '429', '401', 'unauthorized', 'crumb']):
-            _set_last_fetch_error(ticker, 'rate_limited', msg)
-            try:
-                _register_rate_limit(msg)
-            except Exception:
-                pass
+        if 'Too Many Requests' in str(e) or 'Rate limited' in str(e):
+            _set_last_fetch_error(ticker, 'rate_limited', str(e))
         return None
 
 def fetch_real_time_data(ticker, app_root, include_price=True, include_intraday=True):
