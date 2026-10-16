@@ -115,6 +115,7 @@ _COLUMN_BOUNDS: Dict[str, Tuple[Optional[float], Optional[float]]] = {
     "earnings_history.runup_20d_pct": (-100.0, 800.0),
     "earnings_history.eps_surprise_pct": (-1e5, 1e5),
     "earnings_calendar.implied_move_pct": (0.0, 100.0),
+    "earnings_extended_moves.pct_vs_close": (-100.0, 400.0),
     "earnings_history.revenue_surprise_pct": (-100.0, 1e5),
     # ratios that cannot be negative
     "fundamental_data.current_ratio": (0.0, None),

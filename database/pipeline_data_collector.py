@@ -23,9 +23,13 @@ This module focuses purely on data collection and does NOT generate any reports.
 """
 
 import os
+import re
+import glob
 import sys
+import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, Tuple, Optional, List
 import pandas as pd
 import yfinance as yf
@@ -43,6 +47,7 @@ from analysis_scripts.fundamental_analysis import extract_quarterly_earnings_dat
 
 logger = logging.getLogger(__name__)
 
+
 def news_time_utc(article: dict) -> Optional[datetime]:
     """Publish time of a news article as a naive UTC datetime (None when it has none)."""
     content = article.get('content') if isinstance(article.get('content'), dict) else {}
@@ -56,6 +61,64 @@ def news_time_utc(article: dict) -> Optional[datetime]:
         return stamp.tz_convert(None) if stamp.tzinfo is not None else stamp
     except Exception:
         return None
+
+
+# Slow-moving data (company profile, balance sheet, financials, quarterly earnings, insider
+# transactions, peers, Prophet forecast) is refreshed every REFRESH_PERIOD_DAYS on a slot day
+# derived from a stable hash of the symbol, so about 1/30 of the universe refreshes on any night.
+# A calendar-month cache made every stock cold on the first night of each month (~45 Yahoo
+# requests per stock instead of ~15, and every forecast retrained together).
+REFRESH_PERIOD_DAYS = 30
+_REFRESH_EPOCH = date(2026, 1, 1)
+# Data fetched before this date came from the calendar-month schedule. It stays valid until the
+# symbol's first slot day after the end of its month, so the old caches expire spread over the
+# following month instead of together. Must be a first-of-month date.
+ROLLING_REFRESH_START = date(2026, 11, 1)
+
+_CACHE_DATE_RE = r'(\d{4}-\d{2}(?:-\d{2})?)'
+
+
+def _utc_today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def refresh_slot(symbol: str) -> int:
+    """Stable day-of-cycle (0..REFRESH_PERIOD_DAYS-1) on which this symbol's slow data refreshes."""
+    digest = hashlib.sha1(symbol.strip().upper().encode('utf-8')).digest()
+    return int.from_bytes(digest[:4], 'big') % REFRESH_PERIOD_DAYS
+
+
+def last_refresh_day(symbol: str, today: Optional[date] = None) -> date:
+    """The symbol's most recent slot day on or before ``today`` (UTC)."""
+    today = today or _utc_today()
+    days_since_slot = ((today - _REFRESH_EPOCH).days - refresh_slot(symbol)) % REFRESH_PERIOD_DAYS
+    return today - timedelta(days=days_since_slot)
+
+
+def refresh_cutoff(symbol: str, today: Optional[date] = None) -> date:
+    """Data for ``symbol`` fetched on or after this UTC date is current; anything older is refetched."""
+    last_slot = last_refresh_day(symbol, today)
+    if last_slot < ROLLING_REFRESH_START:
+        return last_slot.replace(day=1)
+    return last_slot
+
+
+def as_utc_date(value) -> Optional[date]:
+    """UTC calendar date of a DB timestamp (ISO string or datetime); naive values are taken as UTC."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).date() if value.tzinfo else value.date()
+    if isinstance(value, date):
+        return value
+    return None
+
+
+def _cache_file_date(stamp: str) -> date:
+    """Date from a cache file stamp: ``YYYY-MM-DD``, or legacy ``YYYY-MM`` (first of the month)."""
+    return date.fromisoformat(stamp if len(stamp) == 10 else f'{stamp}-01')
 
 
 class PipelineDataCollector:
@@ -91,27 +154,71 @@ class PipelineDataCollector:
         except Exception:
             return None
     
-    def _is_forecast_calculated_this_month(self, ticker: str) -> bool:
+    def _cache_dir(self, subdir: str) -> Path:
+        return Path(self.app_root) / 'generated_data' / subdir
+
+    @staticmethod
+    def _cache_name_pattern(ticker: str, kind: str):
+        return re.compile(re.escape(f'{ticker}_{kind}_') + _CACHE_DATE_RE + r'\.json')
+
+    def _current_cache_file(self, subdir: str, ticker: str, kind: str) -> Optional[Path]:
         """
-        Check if forecast has already been calculated for this ticker this month
-        
+        Newest ``{ticker}_{kind}_<date>.json`` cache file, if it was fetched on or after the
+        symbol's refresh cutoff; None when there is none or it is due for a refresh.
+
+        Reads the date-stamped names written now and the legacy ``YYYY-MM`` monthly names, so
+        caches written before the switch to the rolling schedule stay usable.
+        """
+        cache_dir = self._cache_dir(subdir)
+        if not cache_dir.is_dir():
+            return None
+        pattern = self._cache_name_pattern(ticker, kind)
+        newest = None
+        for path in cache_dir.glob(f'{glob.escape(ticker)}_{kind}_*.json'):
+            match = pattern.fullmatch(path.name)
+            if not match:
+                continue
+            try:
+                key = (_cache_file_date(match.group(1)), len(match.group(1)))
+            except ValueError:
+                continue
+            if newest is None or key > newest[0]:
+                newest = (key, path)
+        if newest is None or newest[0][0] < refresh_cutoff(ticker):
+            return None
+        return newest[1]
+
+    def _new_cache_file(self, subdir: str, ticker: str, kind: str) -> Path:
+        """Path for a cache fetched today (UTC); creates the cache directory."""
+        cache_dir = self._cache_dir(subdir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / f'{ticker}_{kind}_{_utc_today().isoformat()}.json'
+
+    def _remove_older_cache_files(self, cache_file: Path, ticker: str, kind: str) -> None:
+        """Delete this ticker's other cache files of the same kind once ``cache_file`` is written."""
+        pattern = self._cache_name_pattern(ticker, kind)
+        for path in cache_file.parent.glob(f'{glob.escape(ticker)}_{kind}_*.json'):
+            if path != cache_file and pattern.fullmatch(path.name):
+                try:
+                    path.unlink()
+                    logger.info(f"  Removed stale cache file: {path.name}")
+                except OSError as e:
+                    logger.debug(f"Failed to remove old cache file {path.name}: {e}")
+
+    def _is_forecast_cached(self, ticker: str) -> bool:
+        """
+        Check if a forecast for this ticker was calculated since its refresh cutoff
+
         Args:
             ticker: Stock symbol
-            
+
         Returns:
-            True if forecast calculated this month, False otherwise
+            True if a current forecast is cached, False otherwise
         """
         try:
-            from datetime import datetime
-            from pathlib import Path
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            
-            # Check if cached forecast file exists for this month
-            cache_dir = Path(self.app_root) / 'generated_data' / 'forecast_cache'
-            cache_file = cache_dir / f'{ticker}_forecast_{current_month}.json'
-            
-            if cache_file.exists():
+            cache_file = self._current_cache_file('forecast_cache', ticker, 'forecast')
+
+            if cache_file is not None:
                 # A cache written by an older model version must not be served as current.
                 import json
                 try:
@@ -122,15 +229,15 @@ class PipelineDataCollector:
                 if cached_meta.get('model_version') != TICKZEN_PROPHET_PIPELINE_VERSION:
                     logger.info(f"  ℹ Cached forecast for {ticker} is from another model version - recalculating")
                     return False
-                logger.info(f"  ℹ Forecast already calculated for {ticker} this month ({current_month}) - using cached")
+                logger.info(f"  ℹ Forecast already calculated for {ticker} ({cache_file.name}) - using cached")
                 return True
-                
+
             return False
-            
+
         except Exception as e:
             logger.warning(f"Error checking forecast cache: {e}")
             return False  # If we can't check, proceed with calculation to be safe
-    
+
     def _save_forecast_cache(
         self,
         ticker: str,
@@ -138,118 +245,83 @@ class PipelineDataCollector:
         forecast_metadata: Optional[Dict] = None,
     ) -> None:
         """
-        Save forecast data to monthly cache file and clean up old forecast files
-        
+        Save forecast data to a dated cache file and clean up old forecast files
+
         Args:
             ticker: Stock symbol
             forecast_df: Forecast dataframe to cache
         """
         try:
-            from datetime import datetime
-            from pathlib import Path
             import json
-            import os
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            
-            # Create cache directory
-            cache_dir = Path(self.app_root) / 'generated_data' / 'forecast_cache'
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Clean up old forecast files for this ticker (older than this month)
-            try:
-                for filepath in cache_dir.glob(f'{ticker}_forecast_*.json'):
-                    if current_month not in filepath.name:
-                        try:
-                            os.remove(filepath)
-                            logger.info(f"  Removed stale forecast cache file: {filepath.name}")
-                        except Exception as fe:
-                            logger.debug(f"Failed to clean old forecast file {filepath.name}: {fe}")
-            except Exception as ce:
-                logger.debug(f"Failed to run forecast cache cleanup: {ce}")
 
-            # Save forecast data as JSON
-            cache_file = cache_dir / f'{ticker}_forecast_{current_month}.json'
+            cache_file = self._new_cache_file('forecast_cache', ticker, 'forecast')
             forecast_data = {
                 'ticker': ticker,
-                'date': current_month,
+                'date': _utc_today().isoformat(),
                 'created_at': datetime.now().isoformat(),
                 'forecast': forecast_df.to_dict('records') if forecast_df is not None else None,
                 'forecast_metadata': forecast_metadata,
             }
-            
+
             with open(cache_file, 'w') as f:
                 json.dump(forecast_data, f, default=str)
-                
-            logger.info(f"  ✓ Cached forecast data for {ticker} ({current_month})")
-            
+            self._remove_older_cache_files(cache_file, ticker, 'forecast')
+
+            logger.info(f"  ✓ Cached forecast data for {ticker} ({cache_file.name})")
+
         except Exception as e:
             logger.warning(f"Failed to cache forecast data: {e}")
-    
+
     def _load_forecast_cache(self, ticker: str) -> Optional[pd.DataFrame]:
         """
-        Load cached forecast data for this month
-        
+        Load the current cached forecast data
+
         Args:
             ticker: Stock symbol
-            
+
         Returns:
             Cached forecast DataFrame or None
         """
         try:
-            from datetime import datetime
-            from pathlib import Path
             import json
 
             self._loaded_forecast_metadata = None
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            
-            cache_dir = Path(self.app_root) / 'generated_data' / 'forecast_cache'
-            cache_file = cache_dir / f'{ticker}_forecast_{current_month}.json'
-            
-            if not cache_file.exists():
+
+            cache_file = self._current_cache_file('forecast_cache', ticker, 'forecast')
+            if cache_file is None:
                 return None
-                
+
             with open(cache_file, 'r') as f:
                 cache_data = json.load(f)
-            
+
             if cache_data.get('forecast'):
                 metadata = cache_data.get('forecast_metadata')
                 self._loaded_forecast_metadata = metadata if isinstance(metadata, dict) else None
                 return pd.DataFrame(cache_data['forecast'])
-                
+
             return None
-            
+
         except Exception as e:
             logger.warning(f"Failed to load forecast cache: {e}")
             return None
-    
-    def _is_company_profile_cached_this_month(self, ticker: str) -> bool:
+
+    def _is_company_profile_cached(self, ticker: str) -> bool:
         """
-        Check if company profile has been cached for this ticker this month
-        
+        Check if the company profile for this ticker was cached since its refresh cutoff
+
         Args:
             ticker: Stock symbol
-            
+
         Returns:
-            True if company profile cached this month, False otherwise
+            True if a current company profile is cached, False otherwise
         """
         try:
-            from datetime import datetime
-            from pathlib import Path
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            
-            # Check if cached company profile exists for this month
-            cache_dir = Path(self.app_root) / 'generated_data' / 'profile_cache'
-            cache_file = cache_dir / f'{ticker}_profile_{current_month}.json'
-            
-            if cache_file.exists():
+            cache_file = self._current_cache_file('profile_cache', ticker, 'profile')
+            if cache_file is not None:
                 if not self._load_company_profile_cache(ticker):
                     logger.info(f"  ℹ Cached company profile for {ticker} is empty - refetching")
                     return False
-                logger.info(f"  ℹ Company profile already cached for {ticker} this month ({current_month}) - using cached")
+                logger.info(f"  ℹ Company profile already cached for {ticker} ({cache_file.name}) - using cached")
                 return True
 
             return False
@@ -257,186 +329,132 @@ class PipelineDataCollector:
         except Exception as e:
             logger.warning(f"Error checking company profile cache: {e}")
             return False
-    
-    def _is_insider_transactions_cached_this_month(self, ticker: str) -> bool:
+
+    def _is_insider_transactions_cached(self, ticker: str) -> bool:
         """
-        Check if insider transactions have been cached for this ticker this month
-        
+        Check if insider transactions for this ticker were cached since its refresh cutoff
+
         Args:
             ticker: Stock symbol
-            
+
         Returns:
-            True if insider transactions cached this month, False otherwise
+            True if current insider transactions are cached, False otherwise
         """
         try:
-            from datetime import datetime
-            from pathlib import Path
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            
-            # Check if cached insider transactions exist for this month
-            cache_dir = Path(self.app_root) / 'generated_data' / 'insider_cache'
-            cache_file = cache_dir / f'{ticker}_insider_{current_month}.json'
-            
-            if cache_file.exists():
-                logger.info(f"  ℹ Insider transactions already cached for {ticker} this month ({current_month}) - using cached")
+            cache_file = self._current_cache_file('insider_cache', ticker, 'insider')
+            if cache_file is not None:
+                logger.info(f"  ℹ Insider transactions already cached for {ticker} ({cache_file.name}) - using cached")
                 return True
-                
+
             return False
-            
+
         except Exception as e:
             logger.warning(f"Error checking insider transactions cache: {e}")
             return False
-    
+
     def _save_company_profile_cache(self, ticker: str, profile_data: dict) -> None:
         """
-        Save company profile data to monthly cache file
-        
+        Save company profile data to a dated cache file
+
         Args:
             ticker: Stock symbol
             profile_data: Company profile dictionary to cache
         """
         try:
-            from datetime import datetime
-            from pathlib import Path
             import json
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            
-            # Create cache directory
-            cache_dir = Path(self.app_root) / 'generated_data' / 'profile_cache'
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Save profile data as JSON
-            cache_file = cache_dir / f'{ticker}_profile_{current_month}.json'
+
+            cache_file = self._new_cache_file('profile_cache', ticker, 'profile')
             cache_data = {
                 'ticker': ticker,
-                'month': current_month,
+                'date': _utc_today().isoformat(),
                 'created_at': datetime.now().isoformat(),
                 'profile': profile_data
             }
-            
+
             with open(cache_file, 'w') as f:
                 json.dump(cache_data, f, default=str)
-                
-            logger.info(f"  ✓ Cached company profile for {ticker} ({current_month})")
-            
+            self._remove_older_cache_files(cache_file, ticker, 'profile')
+
+            logger.info(f"  ✓ Cached company profile for {ticker} ({cache_file.name})")
+
         except Exception as e:
             logger.warning(f"Failed to cache company profile: {e}")
-    
+
     def _save_balance_sheet_cache(self, ticker: str, bs_df: pd.DataFrame) -> None:
-        """Save balance sheet DataFrame to monthly cache file"""
+        """Save balance sheet DataFrame to a dated cache file"""
         try:
-            from datetime import datetime
-            from pathlib import Path
-            import pandas as pd
-            
             if bs_df is None or bs_df.empty:
                 return
-                
-            current_month = datetime.now().strftime('%Y-%m')
-            cache_dir = Path(self.app_root) / 'generated_data' / 'profile_cache'
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_file = cache_dir / f'{ticker}_balance_sheet_{current_month}.json'
-            
+
+            cache_file = self._new_cache_file('profile_cache', ticker, 'balance_sheet')
             bs_df.to_json(cache_file, date_format='iso')
-            logger.info(f"  ✓ Cached balance sheet for {ticker} ({current_month})")
+            self._remove_older_cache_files(cache_file, ticker, 'balance_sheet')
+            logger.info(f"  ✓ Cached balance sheet for {ticker} ({cache_file.name})")
         except Exception as e:
             logger.warning(f"Failed to save balance sheet cache: {e}")
 
     def _load_balance_sheet_cache(self, ticker: str) -> Optional[pd.DataFrame]:
-        """Load cached balance sheet DataFrame for current month"""
+        """Load the current cached balance sheet DataFrame"""
         try:
-            from datetime import datetime
-            from pathlib import Path
-            import pandas as pd
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            cache_dir = Path(self.app_root) / 'generated_data' / 'profile_cache'
-            cache_file = cache_dir / f'{ticker}_balance_sheet_{current_month}.json'
-            
-            if not cache_file.exists():
+            cache_file = self._current_cache_file('profile_cache', ticker, 'balance_sheet')
+            if cache_file is None:
                 return None
-                
+
             return pd.read_json(cache_file)
         except Exception as e:
             logger.warning(f"Failed to load balance sheet cache: {e}")
             return None
 
     def _save_financials_cache(self, ticker: str, fin_df: pd.DataFrame) -> None:
-        """Save financials DataFrame to monthly cache file"""
+        """Save financials DataFrame to a dated cache file"""
         try:
-            from datetime import datetime
-            from pathlib import Path
-            import pandas as pd
-            
             if fin_df is None or fin_df.empty:
                 return
-                
-            current_month = datetime.now().strftime('%Y-%m')
-            cache_dir = Path(self.app_root) / 'generated_data' / 'profile_cache'
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_file = cache_dir / f'{ticker}_financials_{current_month}.json'
-            
+
+            cache_file = self._new_cache_file('profile_cache', ticker, 'financials')
             fin_df.to_json(cache_file, date_format='iso')
-            logger.info(f"  ✓ Cached financials for {ticker} ({current_month})")
+            self._remove_older_cache_files(cache_file, ticker, 'financials')
+            logger.info(f"  ✓ Cached financials for {ticker} ({cache_file.name})")
         except Exception as e:
             logger.warning(f"Failed to save financials cache: {e}")
 
     def _load_financials_cache(self, ticker: str) -> Optional[pd.DataFrame]:
-        """Load cached financials DataFrame for current month"""
+        """Load the current cached financials DataFrame"""
         try:
-            from datetime import datetime
-            from pathlib import Path
-            import pandas as pd
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            cache_dir = Path(self.app_root) / 'generated_data' / 'profile_cache'
-            cache_file = cache_dir / f'{ticker}_financials_{current_month}.json'
-            
-            if not cache_file.exists():
+            cache_file = self._current_cache_file('profile_cache', ticker, 'financials')
+            if cache_file is None:
                 return None
-                
+
             return pd.read_json(cache_file)
         except Exception as e:
             logger.warning(f"Failed to load financials cache: {e}")
             return None
 
     def _save_quarterly_earnings_cache(self, ticker: str, qe_data: dict) -> None:
-        """Save quarterly earnings dictionary to monthly cache file"""
+        """Save quarterly earnings dictionary to a dated cache file"""
         try:
-            from datetime import datetime
-            from pathlib import Path
             import json
-            
+
             if not qe_data:
                 return
-                
-            current_month = datetime.now().strftime('%Y-%m')
-            cache_dir = Path(self.app_root) / 'generated_data' / 'profile_cache'
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_file = cache_dir / f'{ticker}_quarterly_earnings_{current_month}.json'
-            
+
+            cache_file = self._new_cache_file('profile_cache', ticker, 'quarterly_earnings')
             with open(cache_file, 'w') as f:
                 json.dump(qe_data, f, default=str)
-            logger.info(f"  ✓ Cached quarterly earnings for {ticker} ({current_month})")
+            self._remove_older_cache_files(cache_file, ticker, 'quarterly_earnings')
+            logger.info(f"  ✓ Cached quarterly earnings for {ticker} ({cache_file.name})")
         except Exception as e:
             logger.warning(f"Failed to save quarterly earnings cache: {e}")
 
     def _load_quarterly_earnings_cache(self, ticker: str) -> Optional[dict]:
-        """Load cached quarterly earnings dictionary for current month"""
+        """Load the current cached quarterly earnings dictionary"""
         try:
-            from datetime import datetime
-            from pathlib import Path
             import json
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            cache_dir = Path(self.app_root) / 'generated_data' / 'profile_cache'
-            cache_file = cache_dir / f'{ticker}_quarterly_earnings_{current_month}.json'
-            
-            if not cache_file.exists():
+
+            cache_file = self._current_cache_file('profile_cache', ticker, 'quarterly_earnings')
+            if cache_file is None:
                 return None
-                
+
             with open(cache_file, 'r') as f:
                 return json.load(f)
         except Exception as e:
@@ -445,190 +463,150 @@ class PipelineDataCollector:
 
     def _save_insider_transactions_cache(self, ticker: str, insider_data: pd.DataFrame) -> None:
         """
-        Save insider transactions data to monthly cache file
-        
+        Save insider transactions data to a dated cache file
+
         Args:
             ticker: Stock symbol
             insider_data: Insider transactions dataframe to cache
         """
         try:
-            from datetime import datetime
-            from pathlib import Path
             import json
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            
-            # Create cache directory
-            cache_dir = Path(self.app_root) / 'generated_data' / 'insider_cache'
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Save insider data as JSON
-            cache_file = cache_dir / f'{ticker}_insider_{current_month}.json'
+
+            cache_file = self._new_cache_file('insider_cache', ticker, 'insider')
             cache_data = {
                 'ticker': ticker,
-                'month': current_month,
+                'date': _utc_today().isoformat(),
                 'created_at': datetime.now().isoformat(),
                 'insider_transactions': insider_data.to_dict('records') if not insider_data.empty else []
             }
-            
+
             with open(cache_file, 'w') as f:
                 json.dump(cache_data, f, default=str)
-                
-            logger.info(f"  ✓ Cached insider transactions for {ticker} ({current_month})")
-            
+            self._remove_older_cache_files(cache_file, ticker, 'insider')
+
+            logger.info(f"  ✓ Cached insider transactions for {ticker} ({cache_file.name})")
+
         except Exception as e:
             logger.warning(f"Failed to cache insider transactions: {e}")
-    
+
     def _load_company_profile_cache(self, ticker: str) -> Optional[dict]:
         """
-        Load cached company profile data for current month
-        
+        Load the current cached company profile data
+
         Args:
             ticker: Stock symbol
-            
+
         Returns:
             Cached company profile dict or None
         """
         try:
-            from datetime import datetime
-            from pathlib import Path
             import json
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            
-            cache_dir = Path(self.app_root) / 'generated_data' / 'profile_cache'
-            cache_file = cache_dir / f'{ticker}_profile_{current_month}.json'
-            
-            if not cache_file.exists():
+
+            cache_file = self._current_cache_file('profile_cache', ticker, 'profile')
+            if cache_file is None:
                 return None
-                
+
             with open(cache_file, 'r') as f:
                 cache_data = json.load(f)
-            
+
             return cache_data.get('profile', {})
-            
+
         except Exception as e:
             logger.warning(f"Failed to load company profile cache: {e}")
             return None
-    
+
     def _load_insider_transactions_cache(self, ticker: str) -> Optional[pd.DataFrame]:
         """
-        Load cached insider transactions data for current month
-        
+        Load the current cached insider transactions data
+
         Args:
             ticker: Stock symbol
-            
+
         Returns:
             Cached insider transactions DataFrame or None
         """
         try:
-            from datetime import datetime
-            from pathlib import Path
             import json
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            
-            cache_dir = Path(self.app_root) / 'generated_data' / 'insider_cache'
-            cache_file = cache_dir / f'{ticker}_insider_{current_month}.json'
-            
-            if not cache_file.exists():
+
+            cache_file = self._current_cache_file('insider_cache', ticker, 'insider')
+            if cache_file is None:
                 return None
-                
+
             with open(cache_file, 'r') as f:
                 cache_data = json.load(f)
-            
+
             insider_records = cache_data.get('insider_transactions', [])
             return pd.DataFrame(insider_records) if insider_records else pd.DataFrame()
-            
+
         except Exception as e:
             logger.warning(f"Failed to load insider transactions cache: {e}")
             return None
 
-    def _is_peer_comparison_cached_this_month(self, ticker: str) -> bool:
+    def _is_peer_comparison_cached(self, ticker: str) -> bool:
         """
-        Check if peer comparison has been cached for this ticker this month
+        Check if peer comparison for this ticker was cached since its refresh cutoff
         """
         try:
-            from datetime import datetime
-            from pathlib import Path
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            cache_dir = Path(self.app_root) / 'generated_data' / 'peer_cache'
-            cache_file = cache_dir / f'{ticker}_peer_{current_month}.json'
-            
-            return cache_file.exists()
+            return self._current_cache_file('peer_cache', ticker, 'peer') is not None
         except Exception as e:
             logger.warning(f"Error checking peer comparison cache: {e}")
             return False
 
     def _save_peer_comparison_cache(self, ticker: str, peer_data: dict) -> None:
         """
-        Save peer comparison data to monthly cache file
+        Save peer comparison data to a dated cache file
         """
         try:
-            from datetime import datetime
-            from pathlib import Path
             import json
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            cache_dir = Path(self.app_root) / 'generated_data' / 'peer_cache'
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            
-            cache_file = cache_dir / f'{ticker}_peer_{current_month}.json'
+
+            cache_file = self._new_cache_file('peer_cache', ticker, 'peer')
             cache_data = {
                 'ticker': ticker,
-                'month': current_month,
+                'date': _utc_today().isoformat(),
                 'created_at': datetime.now().isoformat(),
                 'peer_comparison': peer_data
             }
-            
+
             with open(cache_file, 'w') as f:
                 json.dump(cache_data, f, default=str)
-                
-            logger.info(f"  ✓ Cached peer comparison data for {ticker} ({current_month})")
+            self._remove_older_cache_files(cache_file, ticker, 'peer')
+
+            logger.info(f"  ✓ Cached peer comparison data for {ticker} ({cache_file.name})")
         except Exception as e:
             logger.warning(f"Failed to cache peer comparison data: {e}")
 
     def _load_peer_comparison_cache(self, ticker: str) -> Optional[dict]:
         """
-        Load cached peer comparison data for current month
+        Load the current cached peer comparison data
         """
         try:
-            from datetime import datetime
-            from pathlib import Path
             import json
-            
-            current_month = datetime.now().strftime('%Y-%m')
-            cache_dir = Path(self.app_root) / 'generated_data' / 'peer_cache'
-            cache_file = cache_dir / f'{ticker}_peer_{current_month}.json'
-            
-            if not cache_file.exists():
+
+            cache_file = self._current_cache_file('peer_cache', ticker, 'peer')
+            if cache_file is None:
                 return None
-                
+
             with open(cache_file, 'r') as f:
                 cache_data = json.load(f)
-            
+
             return cache_data.get('peer_comparison', {})
         except Exception as e:
             logger.warning(f"Failed to load peer comparison cache: {e}")
             return None
-    
+
     def _check_forecast_exists_in_database(self, ticker: str) -> bool:
         """
-        Check if forecast data already exists in database for this month
-        
+        Check if the database already has a forecast for this ticker created since its refresh cutoff
+
         Args:
             ticker: Stock symbol
-            
+
         Returns:
-            True if forecast data exists in DB for this month, False otherwise
+            True if a current forecast exists in the DB, False otherwise
         """
         try:
-            from datetime import datetime
-            
-            # Get current month start date
-            current_month_start = datetime.now().strftime('%Y-%m-01')
-            
+            cutoff = refresh_cutoff(ticker).isoformat()
+
             # Get db client (check self.db or fall back to supabase client)
             if hasattr(self, 'db') and self.db:
                 db_client = self.db.client
@@ -644,19 +622,19 @@ class PipelineDataCollector:
                 
             stock_id = stock_response.data[0]['id']
             
-            # Check if forecast data exists for this month
+            # Check if forecast data was created since the refresh cutoff
             forecast_response = db_client.table('forecast_data')\
                 .select('forecast_date')\
                 .eq('stock_id', stock_id)\
                 .eq('model_version', TICKZEN_PROPHET_PIPELINE_VERSION)\
-                .gte('created_at', current_month_start)\
+                .gte('created_at', cutoff)\
                 .limit(1)\
                 .execute()
-            
+
             exists = len(forecast_response.data) > 0
-            
+
             if exists:
-                logger.info(f"  ℹ️ Database already contains forecast data for {ticker} this month ({current_month_start})")
+                logger.info(f"  ℹ️ Database already contains forecast data for {ticker} since {cutoff}")
             
             return exists
             
@@ -773,24 +751,24 @@ class PipelineDataCollector:
                 result['collection_status'] = 'partial'
                 result['processed_data'] = result['stock_data']  # Use unprocessed data
             
-            # Step 4: Generate forecast using Prophet (with monthly caching)
+            # Step 4: Generate forecast using Prophet (retrained on the symbol's 30-day refresh slot)
             logger.info("\nStep 4/6: Generating price forecast...")
-            
+
             forecast_skipped = False
-            
-            # First check if forecast already exists in database for this month
+
+            # First check if a current forecast already exists in the database
             forecast_exists_in_db = self._check_forecast_exists_in_database(ticker)
-            
+
             if forecast_exists_in_db:
-                # Skip expensive model training if database already has current month's data
+                # Skip expensive model training if the database already has a current forecast
                 result['forecast_data'] = pd.DataFrame()  # Empty - will be loaded from DB during export
                 result['forecast_model'] = None
                 result['actual_data'] = None
                 forecast_skipped = True
-                logger.info(f"  ⏭️  Forecast already exists in database for this month - skipping Prophet training")
+                logger.info(f"  ⏭️  Current forecast already exists in database - skipping Prophet training")
             
             # If no database record, check file cache
-            elif self._is_forecast_calculated_this_month(ticker):
+            elif self._is_forecast_cached(ticker):
                 # Load cached forecast
                 cached_forecast = self._load_forecast_cache(ticker)
                 if cached_forecast is not None:
@@ -867,9 +845,9 @@ class PipelineDataCollector:
                 yf_ticker = _yf_ticker(ticker)
                 
                 # Check cache statuses first
-                profile_cached = self._is_company_profile_cached_this_month(ticker)
-                insider_cached = self._is_insider_transactions_cached_this_month(ticker)
-                peer_cached = self._is_peer_comparison_cached_this_month(ticker)
+                profile_cached = self._is_company_profile_cached(ticker)
+                insider_cached = self._is_insider_transactions_cached(ticker)
+                peer_cached = self._is_peer_comparison_cached(ticker)
                 
                 # Define fetching functions
                 def fetch_info():
@@ -931,22 +909,16 @@ class PipelineDataCollector:
                     return recs
 
                 def fetch_balance_sheet():
-                    if profile_cached:
-                        from pathlib import Path
-                        cache_file = Path(self.app_root) / 'generated_data' / 'profile_cache' / f'{ticker}_balance_sheet_{datetime.now().strftime("%Y-%m")}.json'
-                        if cache_file.exists():
-                            return None
+                    if profile_cached and self._current_cache_file('profile_cache', ticker, 'balance_sheet'):
+                        return None
                     logger.info("  ⚡ Starting balance sheet fetch...")
                     bs = yf_ticker.balance_sheet
                     logger.info("  ⚡ Finished balance sheet fetch.")
                     return bs
 
                 def fetch_financials():
-                    if profile_cached:
-                        from pathlib import Path
-                        cache_file = Path(self.app_root) / 'generated_data' / 'profile_cache' / f'{ticker}_financials_{datetime.now().strftime("%Y-%m")}.json'
-                        if cache_file.exists():
-                            return None
+                    if profile_cached and self._current_cache_file('profile_cache', ticker, 'financials'):
+                        return None
                     logger.info("  ⚡ Starting financials fetch...")
                     fin = yf_ticker.financials
                     logger.info("  ⚡ Finished financials fetch.")
@@ -970,11 +942,8 @@ class PipelineDataCollector:
                     return div
 
                 def fetch_quarterly():
-                    if profile_cached:
-                        from pathlib import Path
-                        cache_file = Path(self.app_root) / 'generated_data' / 'profile_cache' / f'{ticker}_quarterly_earnings_{datetime.now().strftime("%Y-%m")}.json'
-                        if cache_file.exists():
-                            return None
+                    if profile_cached and self._current_cache_file('profile_cache', ticker, 'quarterly_earnings'):
+                        return None
                     logger.info("  ⚡ Starting quarterly earnings fetch...")
                     qe = extract_quarterly_earnings_data(result, ticker)
                     logger.info("  ⚡ Finished quarterly earnings fetch.")
@@ -1034,6 +1003,8 @@ class PipelineDataCollector:
                 else:
                     info_val = fetched_data.get('info')
                     result['info'] = info_val if info_val is not None else {}
+                    # Tells the exporter to write the stocks profile even if this worker had no cache.
+                    result['profile_refreshed'] = bool(result['info'])
                     if result['info']:
                         self._save_company_profile_cache(ticker, result['info'])
                         logger.info(f"  ✓ Processed and cached fresh company info")

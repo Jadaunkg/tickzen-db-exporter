@@ -39,7 +39,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 
-from database.pipeline_data_collector import PipelineDataCollector
+from database.pipeline_data_collector import PipelineDataCollector, as_utc_date, refresh_cutoff
 from database.data_mapper import DataMapper
 from Models.forecast_core import PIPELINE_VERSION as TICKZEN_PROPHET_PIPELINE_VERSION
 from database.supabase_client import SupabaseClient
@@ -417,32 +417,32 @@ class SupabaseDataExporter:
             on_conflict=on_conflict,
         ).execute()
     
-    def _is_forecast_updated_this_month(self, stock_id: int) -> bool:
+    def _is_forecast_current(self, stock_id: int, ticker: str) -> bool:
         """
-        Check if forecast data has been updated for this stock in the current month
-        
+        Check if forecast data for this stock was created since the symbol's refresh cutoff
+
         Args:
             stock_id: Database ID of the stock
-            
+            ticker: Stock symbol (sets the staggered 30-day refresh slot)
+
         Returns:
-            True if forecast data exists for this month, False otherwise
+            True if current forecast data exists, False otherwise
         """
         try:
-            from datetime import datetime
-            current_month = datetime.now().strftime('%Y-%m')
-            
-            # Check if there's any forecast data for this stock created/updated this month
+            cutoff = refresh_cutoff(ticker).isoformat()
+
+            # Check if there's any forecast data for this stock created since the cutoff
             result = self.db.client.table('forecast_data')\
                 .select('forecast_date')\
                 .eq('stock_id', stock_id)\
                 .eq('model_version', TICKZEN_PROPHET_PIPELINE_VERSION)\
-                .gte('created_at', f'{current_month}-01')\
+                .gte('created_at', cutoff)\
                 .limit(1)\
                 .execute()
-            
+
             has_data = bool(result.data)
             if has_data:
-                logger.info(f"  ℹ Forecast data already updated this month ({current_month}) - skipping")
+                logger.info(f"  ℹ Forecast data already updated since {cutoff} - skipping")
             
             return has_data
             
@@ -502,63 +502,52 @@ class SupabaseDataExporter:
             logger.warning(f"Error checking weekly ownership update status: {e}")
         return False
     
-    def _is_company_profile_updated_this_month(self, stock_id: int) -> bool:
+    def _profile_needs_update(self, ticker: str, stock_row: Dict, collected_data: Dict) -> bool:
         """
-        Check if company profile data has been updated for this stock in the current month
-        
-        Args:
-            stock_id: Database ID of the stock
-            
-        Returns:
-            True if company profile updated this month, False otherwise
+        Whether the full company profile should be written to ``stocks``.
+
+        Written when the row has no profile yet, when the collector fetched a fresh profile (even if
+        this worker had no cache), or when the row was last updated before the symbol's refresh cutoff.
         """
+        if collected_data.get('profile_refreshed'):
+            return True
+        if not stock_row.get('company_name') or not stock_row.get('updated_at'):
+            return True
+        # updated_at moves on every sync, so a row blanked by an empty Yahoo profile
+        # (company_name = ticker, no sector) must be re-written whenever a profile is at hand.
+        if not stock_row.get('sector') or stock_row.get('company_name') == ticker:
+            return True
         try:
-            from datetime import datetime
-            current_month = datetime.now().strftime('%Y-%m')
-            
-            # Check if stock metadata was updated this month
-            result = self.db.client.table('stocks')\
-                .select('updated_at')\
-                .eq('id', stock_id)\
-                .gte('updated_at', f'{current_month}-01')\
-                .limit(1)\
-                .execute()
-            
-            has_data = bool(result.data)
-            if has_data:
-                logger.info(f"  ℹ Company profile already updated this month ({current_month}) - skipping")
-            
-            return has_data
-            
+            return as_utc_date(stock_row['updated_at']) < refresh_cutoff(ticker)
         except Exception as e:
             logger.warning(f"Error checking company profile update status: {e}")
-            return False
-    
-    def _is_insider_transactions_updated_this_month(self, stock_id: int) -> bool:
+            return True
+
+    def _are_insider_transactions_current(self, stock_id: int, ticker: str) -> bool:
         """
-        Check if insider transactions have been updated for this stock in the current month
-        
+        Check if insider transactions for this stock were written since the symbol's refresh cutoff
+
         Args:
             stock_id: Database ID of the stock
-            
+            ticker: Stock symbol (sets the staggered 30-day refresh slot)
+
         Returns:
-            True if insider transactions updated this month, False otherwise
+            True if insider transactions were updated since the cutoff, False otherwise
         """
         try:
-            from datetime import datetime
-            current_month = datetime.now().strftime('%Y-%m')
-            
-            # Check if there are any insider transactions for this stock created this month
+            cutoff = refresh_cutoff(ticker).isoformat()
+
+            # Check if there are any insider transactions for this stock created since the cutoff
             result = self.db.client.table('insider_transactions')\
                 .select('transaction_date')\
                 .eq('stock_id', stock_id)\
-                .gte('created_at', f'{current_month}-01')\
+                .gte('created_at', cutoff)\
                 .limit(1)\
                 .execute()
-            
+
             has_data = bool(result.data)
             if has_data:
-                logger.info(f"  ℹ Insider transactions already updated this month ({current_month}) - skipping")
+                logger.info(f"  ℹ Insider transactions already updated since {cutoff} - skipping")
             
             return has_data
             
@@ -755,39 +744,21 @@ class SupabaseDataExporter:
             # Reset mapper stats
             self.mapper.reset_sync_stats()
             
-            # 2.1: Export stock metadata (company profile - monthly update)
+            # 2.1: Export stock metadata (company profile - staggered 30-day refresh)
             logger.info("\n[1/11] Exporting stock metadata...")
-            
-            # First, check if the stock already exists and has a valid profile updated this month
+
+            # First, check if the stock already exists and has a valid profile updated since its refresh cutoff
             existing_stock = self.db.client.table('stocks')\
                 .select('id, updated_at, company_name, sector')\
                 .eq('symbol', ticker)\
                 .execute()
-
+            
             stock_id = None
             profile_needs_update = True
-
+            
             if existing_stock.data:
                 stock_id = existing_stock.data[0]['id']
-                company_name = existing_stock.data[0].get('company_name')
-                updated_at_val = existing_stock.data[0].get('updated_at')
-
-                # updated_at moves on every sync, so a row blanked by an empty Yahoo profile
-                # (company_name = ticker, no sector) must be re-written whenever a profile is at hand.
-                has_profile = bool(existing_stock.data[0].get('sector')) and company_name != ticker
-                if company_name and updated_at_val and has_profile:
-                    try:
-                        current_month = datetime.now().strftime('%Y-%m')
-                        
-                        if isinstance(updated_at_val, str):
-                            is_updated_this_month = updated_at_val.startswith(current_month)
-                        else:
-                            is_updated_this_month = updated_at_val.strftime('%Y-%m') == current_month
-                            
-                        if is_updated_this_month:
-                            profile_needs_update = False
-                    except Exception as e:
-                        logger.warning(f"Error checking company profile update status: {e}")
+                profile_needs_update = self._profile_needs_update(ticker, existing_stock.data[0], collected_data)
             
             # If stock record does not exist in DB, create the basic row first
             if stock_id is None:
@@ -810,7 +781,7 @@ class SupabaseDataExporter:
             
             # Now decide whether to update the full profile or skip
             if not profile_needs_update:
-                logger.info("  ⏭️  Company profile already updated this month - skipping profile update")
+                logger.info("  ⏭️  Company profile already current - skipping profile update")
                 
                 # Sync markers are written only after all export phases and the
                 # sync log succeed; otherwise a later failure could leave a
@@ -1016,12 +987,12 @@ class SupabaseDataExporter:
                 logger.warning(f"  ⚠️  Could not export analyst detail: {e}")
                 result['records_exported']['analyst_detail_data'] = 0
 
-            # 2.5: Export forecast data (12 monthly forecasts - updated monthly only)
+            # 2.5: Export forecast data (12 monthly forecasts - staggered 30-day refresh)
             logger.info("\n[5/11] Exporting forecast data...")
             
-            # Check if forecast data was already updated this month
-            if self._is_forecast_updated_this_month(stock_id):
-                logger.info("  ⏭️  Forecast data already updated this month - skipping")
+            # Check if forecast data is already current
+            if self._is_forecast_current(stock_id, ticker):
+                logger.info("  ⏭️  Forecast data already current - skipping")
                 result['records_exported']['forecast_data'] = 0  # Track as skipped
             elif collected_data.get('forecast_data') is not None:
                 forecast_records = self.mapper.map_forecast_data(
@@ -1321,12 +1292,12 @@ class SupabaseDataExporter:
                 logger.info("  ℹ No news data available")
                 result['records_exported']['stock_news_data'] = 0
             
-            # 2.12: Export insider transactions (monthly update)
+            # 2.12: Export insider transactions (staggered 30-day refresh)
             logger.info("\n[12/12] Exporting insider transactions...")
             
-            # Check if insider transactions were already updated this month
-            if self._is_insider_transactions_updated_this_month(stock_id):
-                logger.info("  ⏭️  Insider transactions already updated this month - skipping")
+            # Check if insider transactions are already current
+            if self._are_insider_transactions_current(stock_id, ticker):
+                logger.info("  ⏭️  Insider transactions already current - skipping")
                 result['records_exported']['insider_transactions'] = 0  # Track as skipped
             elif collected_data.get('insider_transactions') is not None and not collected_data['insider_transactions'].empty:
                 insider_records = self.mapper.map_insider_transactions(
