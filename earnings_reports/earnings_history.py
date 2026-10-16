@@ -363,11 +363,22 @@ def straddle_check(
     common = sorted(set(call_by_strike) & set(put_by_strike), key=lambda k: abs(k - spot))
     if not common:
         return None, "no_common_strike"
-    strike = common[0]
-    if abs(strike - spot) / spot > 0.05:          # nothing near the money -> not a real straddle
-        return None, "no_strike_near_spot"
-    call, put = call_by_strike[strike], put_by_strike[strike]
+    # The two strikes nearest the spot (one strike step apart) price practically the same straddle, so the
+    # nearer one is tried first and the other only when the nearer one fails a quote gate (often a half-strike
+    # with almost no open interest).  Both must be within 5 % of the spot.
+    first_reason = None
+    for strike in common[:2]:
+        if abs(strike - spot) / spot > 0.05:      # nothing near the money -> not a real straddle
+            reason = "no_strike_near_spot"
+        else:
+            move, reason = _straddle_at(spot, call_by_strike[strike], put_by_strike[strike])
+            if move is not None:
+                return move, reason
+        first_reason = first_reason or reason
+    return None, first_reason
 
+
+def _straddle_at(spot: float, call: Dict[str, Any], put: Dict[str, Any]) -> Tuple[Optional[float], str]:
     legs = []
     for leg in (call, put):
         price, spread = _mid(finite(leg.get("bid")), finite(leg.get("ask")))
