@@ -11,19 +11,19 @@ dashboard, so all of them agree on the same rules:
 * ``assign_parts`` splits the monitored stocks between ``worker_count`` workers: ordered by md5(symbol) and
   dealt out in turn, so every worker computes the same split and parts differ by at most one stock.
 
-``stocks.last_sync_date`` holds the exporter's local wall-clock time (IST on the Mac and in the containers,
-TZ=Asia/Kolkata) labelled as UTC by the database; ``sync_instant`` reads it back as IST wall time.
+``stocks.last_sync_date`` is real UTC. Until 2026-10-18 the exporter wrote its IST wall-clock time labelled
+UTC (5.5 hours ahead). Reading such an old value as UTC is harmless: scheduled exports end at 09:00 ET, and
+09:00 ET plus 5.5 hours is still before the 16:30 ET cutoff, so no stock looks current when it is not.
 """
 
 from __future__ import annotations
 
 import hashlib
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 MARKET_TZ = ZoneInfo("America/New_York")
-SYNC_WALL_TZ = ZoneInfo("Asia/Kolkata")
 DEFAULT_START = time(16, 30)
 DEFAULT_STOP = time(9, 0)
 MARKET_OPEN = time(9, 30)
@@ -105,12 +105,14 @@ def window_close(now: datetime, start: time = DEFAULT_START, stop: time = DEFAUL
 
 
 def sync_instant(last_sync) -> Optional[datetime]:
-    """``stocks.last_sync_date`` (IST wall time labelled UTC) as a real instant."""
+    """``stocks.last_sync_date`` as an aware UTC instant (naive values are taken as UTC)."""
     if not last_sync:
         return None
     if isinstance(last_sync, str):
-        last_sync = datetime.fromisoformat(last_sync)
-    return last_sync.replace(tzinfo=None).replace(tzinfo=SYNC_WALL_TZ)
+        last_sync = datetime.fromisoformat(last_sync.replace('Z', '+00:00'))
+    if last_sync.tzinfo is None:
+        last_sync = last_sync.replace(tzinfo=timezone.utc)
+    return last_sync.astimezone(timezone.utc)
 
 
 def is_current(last_sync, last_status: Optional[str], cutoff: datetime) -> bool:

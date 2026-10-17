@@ -113,6 +113,24 @@ class DataMapper:
             'records_failed': 0
         }
     
+    def map_data_coverage(self, processed_data: Optional[pd.DataFrame]) -> Dict:
+        """
+        ``stocks`` coverage columns (data_start_date, data_end_date, total_records) from the price history.
+
+        Written on every sync, not only with the 30-day profile refresh. Empty when there is no history,
+        so a failed Yahoo fetch never blanks the stored dates (the sitemap lists stocks by data_end_date).
+        """
+        if processed_data is None or getattr(processed_data, 'empty', True) or 'Date' not in processed_data:
+            return {}
+        dates = pd.to_datetime(processed_data['Date'], errors='coerce').dropna()
+        if dates.empty:
+            return {}
+        return {
+            'data_start_date': dates.min().date().isoformat(),
+            'data_end_date': dates.max().date().isoformat(),
+            'total_records': len(processed_data),
+        }
+
     def map_stock_metadata(self, ticker: str, info: Dict, processed_data: pd.DataFrame) -> Dict:
         """
         Map stock metadata to stocks table
@@ -126,15 +144,8 @@ class DataMapper:
             Dict ready for stocks table insertion
         """
         try:
-            # Extract data coverage dates
-            data_start = processed_data['Date'].min() if not processed_data.empty else None
-            data_end = processed_data['Date'].max() if not processed_data.empty else None
-            
-            if isinstance(data_start, pd.Timestamp):
-                data_start = data_start.date()
-            if isinstance(data_end, pd.Timestamp):
-                data_end = data_end.date()
-            
+            coverage = self.map_data_coverage(processed_data)
+
             stock_record = {
                 'symbol': ticker,
                 'ticker': ticker,
@@ -158,15 +169,15 @@ class DataMapper:
                 'business_summary': (info.get('longBusinessSummary') or '')[:500] if info.get('longBusinessSummary') else None,
                 'long_business_summary': info.get('longBusinessSummary'),
                 
-                # Database management
-                'updated_at': datetime.now().isoformat(),
-                'last_sync_date': datetime.now().isoformat(),
+                # Database management (real UTC: the Mac and the containers run on IST)
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+                'last_sync_date': datetime.now(timezone.utc).isoformat(),
                 'last_sync_status': 'success',
                 'data_quality_score': 1.0,  # Will be calculated based on completeness
-                
+
                 # Data coverage
-                'data_start_date': data_start.isoformat() if data_start else None,
-                'data_end_date': data_end.isoformat() if data_end else None,
+                'data_start_date': coverage.get('data_start_date'),
+                'data_end_date': coverage.get('data_end_date'),
                 'total_records': len(processed_data),
                 
                 # Tracking

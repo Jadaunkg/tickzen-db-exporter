@@ -28,7 +28,7 @@ import logging
 import time
 import re
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict
 
 # Add parent directory to path
@@ -620,6 +620,23 @@ class SupabaseDataExporter:
         except Exception as e:
             logger.warning(f"Error filtering new records: {e}")
             return data  # Return original data if filtering fails
+
+    def _write_final_sync_markers(self, stock_id: int, status: str, processed_data) -> None:
+        """
+        Stamp the finished sync on ``stocks`` and move its coverage dates.
+
+        The coverage dates (data_end_date, ...) used to be written only with the 30-day profile refresh, so a
+        stock whose profile came from the cache kept the data_end_date of its last refresh. Timestamps are real
+        UTC; the Mac and the containers run on IST and a naive now() was stored 5.5 hours ahead.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        # UPDATE, not UPSERT: only these columns are touched, so no NOT NULL profile column is needed.
+        self.db.client.table('stocks').update({
+            'updated_at': now,
+            'last_sync_date': now,
+            'last_sync_status': status,  # success, partial, or failed
+            **self.mapper.map_data_coverage(processed_data),
+        }).eq('id', stock_id).execute()
 
     def _verify_stock_sync_persisted(self, stock_id: int, expected_status: str) -> None:
         """Verify the final stock sync marker is readable after the write."""
@@ -1464,16 +1481,9 @@ class SupabaseDataExporter:
             # CRITICAL FIX: Final timestamp update to ensure updated_at and last_sync_date are always current
             logger.info("\nFINAL STEP: Updating sync timestamps")
             logger.info("-" * 40)
-            
-            # Use UPDATE instead of UPSERT to only touch timestamp fields and avoid NULL violations
-            self.db.client.table('stocks').update(
-                {
-                    'updated_at': datetime.now().isoformat(),
-                    'last_sync_date': datetime.now().isoformat(),
-                    'last_sync_status': result['status']  # success, partial, or failed
-                }
-            ).eq('id', stock_id).execute()
-            
+
+            self._write_final_sync_markers(stock_id, result['status'], collected_data.get('processed_data'))
+
             logger.info(f"  ✓ Final sync timestamps updated for stock ID {stock_id}")
 
             # Confirm the final marker can be read back from the database. This
