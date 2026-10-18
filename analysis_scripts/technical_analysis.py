@@ -1431,7 +1431,7 @@ def get_options_data(ticker_symbol: str) -> dict | None:
             return None
         current_price = float(current_price)
 
-        from datetime import date as _date, datetime as _datetime, timedelta as _timedelta
+        from datetime import date as _date, datetime as _datetime, timedelta as _timedelta, timezone as _timezone
         today      = _date.today()
         today_str  = str(today)
 
@@ -1695,9 +1695,9 @@ def get_options_data(ticker_symbol: str) -> dict | None:
                     put_iv = v
                     break
 
-        # Average IV
+        # Average IV (None when neither leg solves: 0 would read as "options are cheap")
         valid_ivs = [v for v in [call_iv, put_iv] if v is not None]
-        avg_iv = sum(valid_ivs) / len(valid_ivs) if valid_ivs else 0.0
+        avg_iv = sum(valid_ivs) / len(valid_ivs) if valid_ivs else None
 
         # --- IV context score via rolling 30-day realized vol proxy ---
         # yfinance does not provide a reliable per-stock historical IV time series,
@@ -1711,7 +1711,7 @@ def get_options_data(ticker_symbol: str) -> dict | None:
             hist['returns'] = hist['Close'].pct_change()
             rolling_vol = hist['returns'].rolling(30).std() * np.sqrt(252) * 100
             rolling_vol = rolling_vol.dropna()
-            if len(rolling_vol) >= 20 and avg_iv > 0:
+            if len(rolling_vol) >= 20 and avg_iv:
                 iv_52w_low = float(rolling_vol.quantile(0.10))
                 iv_52w_high = float(rolling_vol.quantile(0.90))
                 if iv_52w_high > iv_52w_low:
@@ -1719,7 +1719,29 @@ def get_options_data(ticker_symbol: str) -> dict | None:
                     iv_rank = max(0.0, min(100.0, iv_rank))
                     iv_rank_method = "rv30_proxy"
 
-        signal_label, signal_detail = interpret_iv(avg_iv, iv_rank, is_proxy=(iv_rank_method == "rv30_proxy"))
+        if avg_iv is None:
+            signal_label, signal_detail = "Unavailable", "ATM implied volatility could not be computed from the option quotes."
+        else:
+            signal_label, signal_detail = interpret_iv(avg_iv, iv_rank, is_proxy=(iv_rank_method == "rv30_proxy"))
+
+        # An earnings report before the chosen expiry lifts both the IV and the straddle: say so, or a
+        # pre-earnings premium reads as "options are expensive" with nothing behind it.
+        earnings_in_window = None
+        for key in ('earningsTimestampStart', 'earningsTimestamp'):
+            try:
+                stamp = info.get(key)
+                report_day = _datetime.fromtimestamp(float(stamp), tz=_timezone.utc).date() if stamp else None
+            except (TypeError, ValueError, OverflowError, OSError):
+                report_day = None
+            if report_day and today <= report_day <= _datetime.strptime(nearest_expiry, '%Y-%m-%d').date():
+                earnings_in_window = str(report_day)
+                break
+        if earnings_in_window and avg_iv is not None:
+            signal_detail = (
+                f"{signal_detail} The {nearest_expiry} options include the earnings report on {earnings_in_window}, "
+                "so part of this IV and of the implied move is the expected earnings reaction; it usually falls "
+                "once the report is out."
+            )
 
         implied_move_scaled_30d = False
         implied_move_pct_30d = implied_move_pct
@@ -1750,7 +1772,8 @@ def get_options_data(ticker_symbol: str) -> dict | None:
             "implied_move_is_30d_scaled": implied_move_scaled_30d,
             "call_iv":               round(call_iv, 1) if call_iv is not None else None,
             "put_iv":                round(put_iv, 1)  if put_iv  is not None else None,
-            "atm_iv":                round(avg_iv, 1),
+            "atm_iv":                round(avg_iv, 1) if avg_iv is not None else None,
+            "earnings_in_window":    earnings_in_window,
             "iv_rank":               round(iv_rank, 1) if iv_rank is not None else None,
             "iv_rank_method":        iv_rank_method,
             "iv_52w_high":           round(iv_52w_high, 1) if iv_52w_high is not None else None,
@@ -1778,8 +1801,11 @@ def validate_options_data(options_result: dict, stock_price: float) -> bool:
 
     warnings = []
 
-    avg_iv = options_result.get('atm_iv', 0) or 0
-    if avg_iv < 15:
+    avg_iv = options_result.get('atm_iv')
+    if avg_iv is None:
+        warnings.append("WARNING: ATM IV could not be computed from the option quotes")
+        avg_iv = 0
+    elif avg_iv < 15:
         warnings.append(f"CRITICAL: ATM IV {avg_iv:.1f}% is below 15% — likely wrong expiry selected (check DTE)")
     if avg_iv > 200:
         warnings.append(f"CRITICAL: ATM IV {avg_iv:.1f}% is above 200% — likely a data error")

@@ -251,11 +251,10 @@ class SentimentAnalyzer:
             if total_call_volume + total_put_volume == 0:
                 return {'score': 0, 'classification': 'neutral', 'confidence': 0}
             
-            # Standard Put/Call Ratio (Put / Call)
-            if total_call_volume > 0:
-                put_call_ratio = total_put_volume / total_call_volume
-            else:
-                put_call_ratio = 5.0 # extreme put volume / bearish fallback
+            # Standard Put/Call Ratio (Put / Call).  No call volume -> no ratio (not a made-up 5.0).
+            if total_call_volume <= 0:
+                return {'score': 0, 'classification': 'neutral', 'confidence': 0}
+            put_call_ratio = total_put_volume / total_call_volume
             
             # Map standard PCR to a sentiment score between -1 and 1
             # Standard neutral PCR is around 0.8.

@@ -380,7 +380,8 @@ def refresh_implied_moves(
         move = result["implied_move_pct"] if result else None
         expiry = result["expiry"] if result else None
         if move is None and row.get("implied_move_pct") is not None \
-                and eh.expiry_covers(eh._as_date(row.get("implied_move_expiry")), report, session):
+                and eh.expiry_covers(eh._as_date(row.get("implied_move_expiry")), report, session,
+                                     max_days=eh.TERM_MAX_FIRST_EXPIRY_DAYS):
             kept += 1          # a miss never erases an earlier live quote that still covers this report
             continue
         db.execute_raw_sql(

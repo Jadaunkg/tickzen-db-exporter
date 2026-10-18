@@ -7,14 +7,16 @@ and computed, never invented:
 * ``build_history_records``    EPS estimate / actual / surprise + the measured price reaction
 * ``measure_reaction``         close-to-close move over the first session that reflects the report
 * ``implied_move_from_chain``  nearest at-the-money straddle that expires after the report
+* ``event_move_from_term_structure``  earnings-only move from two later expiries (monthly-only options)
 
 Honesty rules (these are what keep the numbers trustworthy enough to publish):
 
 * A reaction is only stored when the report time (before open / after close) is known.
 * If the *other* session shows a far bigger move than the labelled one, the label is suspect and the
   reaction is dropped (NULL) rather than guessed.
-* An implied move is only stored from a liquid, tight-spread straddle that expires close to the report,
-  quoted live during the regular session.  Outside it Yahoo zeroes every bid, ask and open interest, and
+* An implied move is only stored from liquid, tight-spread straddles quoted live during the regular
+  session: one that expires close to the report, or else two later ones whose difference separates the
+  earnings jump from ordinary time value.  Outside it Yahoo zeroes every bid, ask and open interest, and
   the last trades can be days old, so an after-hours chain is never used (see ``fetch_implied_move``).
 * Units follow ``database/column_units.json``: every ``*_pct`` here is in **percent points**.
 """
@@ -26,10 +28,13 @@ import math
 import time
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 from earnings_reports.rate_limit import RateLimiter, get_limiter  # noqa: E402,F401  (RateLimiter re-exported)
 
 logger = logging.getLogger(__name__)
+
+_NEW_YORK = ZoneInfo("America/New_York")
 
 BMO = "BMO"  # before market open
 AMC = "AMC"  # after market close
@@ -51,6 +56,10 @@ RUNUP_LONG_SESSIONS = 20     # about one month
 
 # Implied-move gates.
 MAX_EXPIRY_AFTER_REACTION_DAYS = 10     # a far-dated straddle is mostly time value, not the earnings jump
+# Term-structure fallback (stocks with monthly options only): two expiries that both contain the reaction.
+TERM_MAX_FIRST_EXPIRY_DAYS = 45         # first expiry at most this many days after the reaction
+TERM_MAX_SECOND_EXPIRY_DAYS = 120       # second expiry likewise
+TERM_MAX_CHAINS = 4                     # chains tried for the two (an illiquid expiry is skipped)
 MIN_STRADDLE_OPEN_INTEREST = 100        # call OI + put OI at the chosen strike
 MAX_RELATIVE_SPREAD = 0.35              # (ask - bid) / mid per leg
 MAX_IMPLIED_MOVE_PCT = 60.0
@@ -426,12 +435,57 @@ def _reaction_day(report: date, session: Optional[str]) -> date:
     return report if session in (BMO, DMH) else report + timedelta(days=1)
 
 
-def expiry_covers(expiry: Optional[date], report: date, session: Optional[str]) -> bool:
-    """True when a straddle expiring on ``expiry`` contains the reaction session and is not far-dated."""
+def expiry_covers(expiry: Optional[date], report: date, session: Optional[str],
+                  max_days: int = MAX_EXPIRY_AFTER_REACTION_DAYS) -> bool:
+    """True when a straddle expiring on ``expiry`` contains the reaction session and is not far-dated.
+
+    ``max_days=TERM_MAX_FIRST_EXPIRY_DAYS`` accepts the first expiry of a term-structure move too."""
     if expiry is None:
         return False
     days = (expiry - _reaction_day(report, session)).days
-    return 0 <= days <= MAX_EXPIRY_AFTER_REACTION_DAYS
+    return 0 <= days <= max_days
+
+
+def pick_term_expiries(expiries: Sequence[str], report: date, session: Optional[str],
+                       skip: Optional[date] = None) -> List[date]:
+    """Candidate expiries for a term-structure move: listed expiries that contain the reaction session
+    (``skip`` excluded) within ``TERM_MAX_SECOND_EXPIRY_DAYS``, standard monthlies first (they carry the
+    open interest; weeklies of the same stock are often thin), each group nearest first, up to
+    ``TERM_MAX_CHAINS``.  Empty when fewer than two qualify or none is within ``TERM_MAX_FIRST_EXPIRY_DAYS``."""
+    reaction_day = _reaction_day(report, session)
+    after = sorted(d for d in (_as_date(raw) for raw in expiries)
+                   if d is not None and d != skip and 0 <= (d - reaction_day).days <= TERM_MAX_SECOND_EXPIRY_DAYS)
+    if len(after) < 2 or (after[0] - reaction_day).days > TERM_MAX_FIRST_EXPIRY_DAYS:
+        return []
+    return sorted(after, key=lambda d: (not _is_monthly_expiry(d), d))[:TERM_MAX_CHAINS]
+
+
+def _is_monthly_expiry(day: date) -> bool:
+    """Standard monthly option expiry: the third Friday."""
+    return day.weekday() == 4 and 15 <= day.day <= 21
+
+
+def event_move_from_term_structure(near_move: Optional[float], near_days: int,
+                                   far_move: Optional[float], far_days: int) -> Tuple[Optional[float], str]:
+    """Earnings-only move (percent points) from two straddles that both contain the report.
+
+    An ATM straddle / spot is proportional to the total standard deviation to expiry, and the total variance
+    is the normal diffusion (proportional to time) plus the one-off earnings jump:  m(T)^2 = k*T + E^2.  Two
+    expiries give k from the slope, and E^2 = m1^2 - k*T1.  E is in the same straddle units as a short-dated
+    straddle, minus the few days of ordinary movement such a straddle also holds."""
+    m1, m2 = finite(near_move), finite(far_move)
+    if m1 is None or m2 is None or not (0 < near_days < far_days):
+        return None, "no_term_structure"
+    if m2 <= m1:
+        return None, "flat_term_structure"      # no positive diffusion slope: cannot separate the event
+    slope = (m2 * m2 - m1 * m1) / (far_days - near_days)
+    event_sq = m1 * m1 - slope * near_days
+    if event_sq <= 0:
+        return None, "no_event_premium"         # the near straddle is no richer than plain time value
+    move = math.sqrt(event_sq)
+    if move > MAX_IMPLIED_MOVE_PCT:
+        return None, "implausible_move"
+    return round(move, 4), "ok"
 
 
 # --------------------------------------------------------------------------- stats (shared read-side logic)
@@ -667,29 +721,67 @@ def fetch_bars(ticker: str, years: int = 6, **call_kwargs: Any) -> List[Bar]:
     return normalize_bars(bars)
 
 
-def fetch_implied_move(ticker: str, report: date, session: Optional[str], **call_kwargs: Any) -> Optional[Dict[str, Any]]:
-    """Implied move for an upcoming report: {implied_move_pct, expiry} or None.  Two Yahoo requests
-    (expiry list + chain); the spot price comes with the chain.
+def fetch_implied_move(ticker: str, report: date, session: Optional[str], *, today: Optional[date] = None,
+                       **call_kwargs: Any) -> Optional[Dict[str, Any]]:
+    """Implied move for an upcoming report: {implied_move_pct, expiry, method} or None.
 
-    Raises ``OptionsMarketClosed`` when the chain's ``marketState`` is not ``REGULAR``: outside the session
-    Yahoo reports bid = ask = openInterest = 0 on every contract (checked on NFLX, META, SPOT and GE at
-    05:30 New York on 2026-10-16), so the caller should stop rather than record a miss for every report."""
+    ``method`` "straddle": the ATM straddle of the first expiry within ``MAX_EXPIRY_AFTER_REACTION_DAYS`` of
+    the reaction (two Yahoo requests: expiry list + chain; the spot comes with the chain).
+    ``method`` "term_structure": when there is no such expiry (monthly options only, e.g. NOC, KEY or MCO
+    after the October monthly) or its straddle fails a quote gate, the earnings-only move is separated from
+    two later expiries that both contain the report (``event_move_from_term_structure``; one or two more
+    chain requests).  ``expiry`` is then the first of the two.
+
+    Raises ``OptionsMarketClosed`` when a chain's ``marketState`` is not ``REGULAR``: before the open Yahoo
+    reports bid = ask = openInterest = 0 on every contract (checked on NFLX, META, SPOT and GE at 05:30 New
+    York on 2026-10-16), so the caller should stop rather than record a miss for every report."""
     import yfinance as yf
 
     handle = yf.Ticker(ticker)
+    chains: Dict[date, Any] = {}
+
+    def straddle(expiry: date) -> Tuple[Optional[float], str]:
+        if expiry not in chains:
+            chains[expiry] = yahoo_call(lambda: handle.option_chain(expiry.isoformat()), **call_kwargs)
+        chain = chains[expiry]
+        underlying = getattr(chain, "underlying", None) or {}
+        state = underlying.get("marketState")
+        if state and state != "REGULAR":
+            raise OptionsMarketClosed(f"marketState={state}")
+        return straddle_check(underlying.get("regularMarketPrice"),
+                              chain.calls.to_dict("records"), chain.puts.to_dict("records"))
+
     expiries = list(yahoo_call(lambda: handle.options, **call_kwargs) or [])
     expiry = pick_expiry(expiries, report, session)
-    if expiry is None:
-        logger.info("implied move %s: no expiry within %s days of the reaction", ticker, MAX_EXPIRY_AFTER_REACTION_DAYS)
+    if expiry is not None:
+        move, reason = straddle(expiry)
+        if move is not None:
+            return {"implied_move_pct": move, "expiry": expiry, "method": "straddle"}
+        logger.info("implied move %s (expiry %s) rejected: %s; trying the term structure", ticker, expiry, reason)
+
+    candidates = pick_term_expiries(expiries, report, session, skip=expiry)
+    if not candidates:
+        logger.info("implied move %s: no usable expiry (none within %s days of the reaction, no term structure)",
+                    ticker, MAX_EXPIRY_AFTER_REACTION_DAYS)
         return None
-    chain = yahoo_call(lambda: handle.option_chain(expiry.isoformat()), **call_kwargs)
-    underlying = getattr(chain, "underlying", None) or {}
-    state = underlying.get("marketState")
-    if state and state != "REGULAR":
-        raise OptionsMarketClosed(f"marketState={state}")
-    move, reason = straddle_check(underlying.get("regularMarketPrice"),
-                                  chain.calls.to_dict("records"), chain.puts.to_dict("records"))
+    quoted_pair: List[Tuple[date, float]] = []
+    for i, candidate in enumerate(candidates):
+        if len(quoted_pair) == 2 or len(candidates) - i < 2 - len(quoted_pair):
+            break                                   # done, or too few candidates left to finish the pair
+        candidate_move, candidate_reason = straddle(candidate)
+        if candidate_move is None:
+            logger.info("implied move %s (term expiry %s) rejected: %s", ticker, candidate, candidate_reason)
+            continue
+        quoted_pair.append((candidate, candidate_move))
+    if len(quoted_pair) < 2:
+        return None
+    (near, near_move), (far, far_move) = sorted(quoted_pair)
+    if (near - _reaction_day(report, session)).days > TERM_MAX_FIRST_EXPIRY_DAYS:
+        logger.info("implied move %s: nearest quoted term expiry %s is too far from the report", ticker, near)
+        return None
+    quoted = today or datetime.now(_NEW_YORK).date()
+    move, reason = event_move_from_term_structure(near_move, (near - quoted).days, far_move, (far - quoted).days)
     if move is None:
-        logger.info("implied move %s (expiry %s) rejected: %s", ticker, expiry, reason)
+        logger.info("implied move %s (term %s/%s: %.2f%%/%.2f%%) rejected: %s", ticker, near, far, near_move, far_move, reason)
         return None
-    return {"implied_move_pct": move, "expiry": expiry}
+    return {"implied_move_pct": move, "expiry": near, "method": "term_structure"}
