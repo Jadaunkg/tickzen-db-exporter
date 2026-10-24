@@ -1326,6 +1326,24 @@ class SupabaseDataExporter:
                     # Sanitize records to remove NaN/Infinity before JSON serialization
                     insider_records = self._sanitize_records_for_json(insider_records)
                     
+                    # Yahoo rows carry no shares-owned-after, so the unique indexes (which separate the holdings of
+                    # one SEC filing by ownership_key) cannot recognise a trade already stored from the SEC feed:
+                    # skip every (insider, date, shares) this stock already has, then insert the rest.
+                    existing = self.db.client.table('insider_transactions')\
+                        .select('insider_name,transaction_date,shares_change')\
+                        .eq('stock_id', stock_id)\
+                        .limit(50000)\
+                        .execute()
+                    stored = {
+                        (str(r.get('insider_name')), str(r.get('transaction_date'))[:10], float(r.get('shares_change') or 0))
+                        for r in (existing.data or [])
+                    }
+                    insider_records = [
+                        r for r in insider_records
+                        if (str(r.get('insider_name')), str(r.get('transaction_date'))[:10],
+                            float(r.get('shares_change') or 0)) not in stored
+                    ]
+
                     # Batch upsert insider transactions (ON CONFLICT DO NOTHING)
                     total_inserted = 0
                     batch_size = 1000
@@ -1333,9 +1351,9 @@ class SupabaseDataExporter:
                         batch = insider_records[i:i+batch_size]
                         has_accessions = all(record.get('accession_number') for record in batch)
                         conflict_key = (
-                            'stock_id,accession_number,transaction_date,shares_change'
+                            'stock_id,accession_number,transaction_date,shares_change,ownership_key'
                             if has_accessions else
-                            'stock_id,insider_name,transaction_date,shares_change'
+                            'stock_id,insider_name,transaction_date,shares_change,ownership_key'
                         )
                         self.db.client.table('insider_transactions').upsert(
                             batch,
