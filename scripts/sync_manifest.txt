@@ -73,6 +73,7 @@ database/migrations/20261005_earnings_runup.sql
 database/migrations/20261006_analyst_detail.sql
 database/migrations/20261016_analyst_eps_trend.sql
 database/migrations/20261016_updater_runs.sql
+database/migrations/20261025_implied_move_status.sql
 
 # --- schema references
 database/COMPLETE_DATABASE_SCHEMA.sql
@@ -91,3 +92,4 @@ earnings_reports/enhanced_data_extractor.py
 earnings_reports/finnhub_financials.py
 earnings_reports/one_time_items_extractor.py
 earnings_reports/rate_limit.py
+earnings_reports/reit_tickers.json

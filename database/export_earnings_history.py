@@ -12,7 +12,7 @@ Usage::
     python database/export_earnings_history.py --all --skip-fresh-hours 168   # backfill / weekly sweep
     python database/export_earnings_history.py --recent-days 4           # stocks that just reported (daily)
     python database/export_earnings_history.py --stalest 40              # batch: least recently checked first
-    python database/export_earnings_history.py --implied --window-days 10    # options-implied moves (market hours only)
+    python database/export_earnings_history.py --implied --window-days 14    # options-implied moves (market hours only)
     python database/export_earnings_history.py --runup-backfill --limit 50   # fill pre-report run-ups for existing rows
 
 The same functions are called by the per-stock exporter (``export_to_supabase.py``) and by the cron
@@ -39,7 +39,8 @@ _as_date = eh._as_date
 
 MIGRATION_PATH = Path(__file__).with_name("migrations") / "20261004_earnings_history.sql"
 RUNUP_MIGRATION_PATH = Path(__file__).with_name("migrations") / "20261005_earnings_runup.sql"
-MIGRATION_PATHS = (MIGRATION_PATH, RUNUP_MIGRATION_PATH)
+IMPLIED_STATUS_MIGRATION_PATH = Path(__file__).with_name("migrations") / "20261025_implied_move_status.sql"
+MIGRATION_PATHS = (MIGRATION_PATH, RUNUP_MIGRATION_PATH, IMPLIED_STATUS_MIGRATION_PATH)
 CALENDAR_LOOKBACK_DAYS = 400   # calendar rows older than this are never needed for the merge
 
 
@@ -93,11 +94,21 @@ def select_stale_stocks(db, limit: int, min_age_hours: int = 144) -> List[Dict[s
     return [{"id": int(r["id"]), "symbol": str(r["symbol"]).upper()} for r in rows]
 
 
-def record_status(db, stock_id: int, rows: int, note: Optional[str] = None) -> None:
+def record_status(db, stock_id: int, rows: int, note: Optional[str] = None, daily_vol: Optional[float] = None) -> None:
+    """``daily_vol`` (percent points) is stored for the single-expiry implied move; None keeps the stored one."""
+    if daily_vol is None:
+        db.execute_raw_sql(
+            "INSERT INTO public.earnings_history_status (stock_id, checked_at, rows, note) VALUES (%s, NOW(), %s, %s) "
+            "ON CONFLICT (stock_id) DO UPDATE SET checked_at = NOW(), rows = EXCLUDED.rows, note = EXCLUDED.note",
+            [stock_id, rows, note],
+        )
+        return
     db.execute_raw_sql(
-        "INSERT INTO public.earnings_history_status (stock_id, checked_at, rows, note) VALUES (%s, NOW(), %s, %s) "
-        "ON CONFLICT (stock_id) DO UPDATE SET checked_at = NOW(), rows = EXCLUDED.rows, note = EXCLUDED.note",
-        [stock_id, rows, note],
+        "INSERT INTO public.earnings_history_status (stock_id, checked_at, rows, note, daily_vol_pct, daily_vol_at) "
+        "VALUES (%s, NOW(), %s, %s, %s, NOW()) "
+        "ON CONFLICT (stock_id) DO UPDATE SET checked_at = NOW(), rows = EXCLUDED.rows, note = EXCLUDED.note, "
+        "daily_vol_pct = EXCLUDED.daily_vol_pct, daily_vol_at = NOW()",
+        [stock_id, rows, note, daily_vol],
     )
 
 
@@ -157,14 +168,16 @@ def refresh_stock_history(
     for record in records:
         record["eps_source_conflict"] = record["earnings_date"] in previously_flagged
     if use_finnhub:
-        eh.flag_source_conflicts(records, fetch_surprises(symbol))
+        eh.flag_source_conflicts(records, fetch_surprises(symbol), strict_actuals=eh.is_reit(symbol))
     conflicts = sum(1 for r in records if r["eps_source_conflict"])
 
     now = datetime.now(timezone.utc)
     for record in records:
         record["updated_at"] = now
     db.table("earnings_history").upsert(records, on_conflict="stock_id,earnings_date").execute()
-    record_status(db, stock_id, len(records))
+    # The same bars give the normal daily movement the single-expiry implied move needs (no extra request).
+    record_status(db, stock_id, len(records),
+                  daily_vol=eh.normal_daily_vol(bars, [r.get("reaction_date") for r in records]))
     return {
         "symbol": symbol,
         "rows": len(records),
@@ -305,16 +318,55 @@ def _aware(value: datetime) -> datetime:
 
 
 # --------------------------------------------------------------------------- implied moves
+NO_OPTIONS_RETRY_HOURS = 7 * 24      # a stock with no listed options is asked again after a week
+CLOSE_REPORT_DAYS = 3                # a miss this close to its report is retried at the short ``close_retry_hours``
+DAILY_VOL_MAX_AGE_DAYS = 14          # a stored normal daily movement older than this is recomputed when needed
+
+
+def _daily_vol_source(db, row: Dict[str, Any], fetch_bars: Callable[..., List[Dict[str, Any]]]) -> Callable[[], Optional[float]]:
+    """Normal daily movement for the single-expiry estimate: the value stored by the last history refresh, or (when
+    missing or old) one price-history request, stored back for the next run.  Only called when that estimate is
+    actually needed."""
+    def get() -> Optional[float]:
+        stamp = row.get("daily_vol_at")
+        if row.get("daily_vol_pct") is not None and stamp is not None \
+                and _aware(stamp) > datetime.now(timezone.utc) - timedelta(days=DAILY_VOL_MAX_AGE_DAYS):
+            return eh.finite(row["daily_vol_pct"])
+        try:
+            bars = fetch_bars(str(row["ticker"]), years=1)
+            reactions = db.execute_raw_sql(
+                "SELECT reaction_date FROM public.earnings_history WHERE stock_id = %s AND reaction_date IS NOT NULL",
+                [row.get("stock_id")]) if row.get("stock_id") is not None else []
+            vol = eh.normal_daily_vol(bars, [r["reaction_date"] for r in reactions])
+        except eh.ProviderThrottled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - no normal movement: the estimate is simply not made
+            logger.warning("daily vol %s failed: %s", row.get("ticker"), exc)
+            return None
+        if vol is not None and row.get("stock_id") is not None:
+            db.execute_raw_sql(
+                "UPDATE public.earnings_history_status SET daily_vol_pct = %s, daily_vol_at = NOW() WHERE stock_id = %s",
+                [vol, row["stock_id"]])
+        return vol
+    return get
+
+
 def refresh_implied_moves(
     db,
     *,
     today: Optional[date] = None,
-    window_days: int = 10,
-    fetch: Callable[[str, date, Optional[str]], Optional[Dict[str, Any]]] = eh.fetch_implied_move,
+    window_days: int = 14,
+    fetch: Callable[..., Optional[Dict[str, Any]]] = eh.fetch_implied_move,
     pause_seconds: float = 0.0,
     max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
     min_age_hours: float = 0.0,
     retry_hours: Optional[float] = None,
+    close_retry_hours: Optional[float] = None,
+    no_options_retry_hours: float = NO_OPTIONS_RETRY_HOURS,
+    max_requests: Optional[int] = None,
+    max_minutes: Optional[float] = None,
+    requests_sent: Callable[[], int] = eh.yahoo_requests_sent,
+    fetch_bars: Callable[..., List[Dict[str, Any]]] = eh.fetch_bars,
 ) -> Dict[str, Any]:
     """Options-implied move for tracked stocks reporting in the next ``window_days`` (paced by the shared
     Yahoo limiter inside ``fetch``; same circuit breaker as ``refresh_histories``).
@@ -322,43 +374,73 @@ def refresh_implied_moves(
     Run it only during the regular session (``earnings_local_update.run_implied``): Yahoo zeroes option quotes
     outside it.  A fetch that raises ``OptionsMarketClosed`` stops the run without writing anything.
 
-    ``min_age_hours`` > 0 skips rows whose stored move is that recent; ``retry_hours`` (default: the same)
-    skips rows whose last attempt found no reliable quote that recently, so an hourly job does not re-request
-    Yahoo for the same reports.  Reports dated today are skipped unless they come after the close: a BMO,
-    intraday or unknown-time report may already be out, and a straddle quoted after it is no expectation.
+    Which reports are due (from ``implied_move_checked_at``, the last attempt; older rows only have
+    ``implied_move_updated_at``):
+    * a stored move is re-quoted after ``min_age_hours``;
+    * a miss is retried after ``retry_hours`` (default: ``min_age_hours``), or after ``close_retry_hours`` (default:
+      ``retry_hours``) once the report is ``CLOSE_REPORT_DAYS`` days away, when option trading picks up;
+    * a stock with no listed options is asked again after ``no_options_retry_hours``.
+    Reports dated today are skipped unless they come after the close: a BMO, intraday or unknown-time report may
+    already be out, and a straddle quoted after it is no expectation.  The nearest reports go first (never-tried
+    ones first within a day), so a run cut short by ``max_requests`` (Yahoo requests, counted by ``requests_sent``)
+    or ``max_minutes`` has done the reports that matter soonest; the rest are due on the next run.
 
     A miss (no reliable quote now) never overwrites a stored move whose expiry still covers the reaction: the row
-    keeps that earlier live quote and its own timestamp, and is retried on the next run."""
+    keeps that earlier live quote and only records the attempt.  Every attempt stores its reason
+    (``implied_move_status``) and every stored move its ``implied_move_method``."""
     today = today or datetime.now(timezone.utc).date()
     rows = db.execute_raw_sql(
         "SELECT c.ticker, c.earnings_date, c.time_of_day, c.implied_move_pct, c.implied_move_expiry, "
-        "c.implied_move_updated_at "
+        "c.implied_move_updated_at, c.implied_move_checked_at, c.implied_move_status, "
+        "s.id AS stock_id, h.daily_vol_pct, h.daily_vol_at "
         "FROM public.earnings_calendar c "
         "JOIN public.stocks s ON COALESCE(s.symbol, s.ticker) = c.ticker AND s.is_active = true "
+        "LEFT JOIN public.earnings_history_status h ON h.stock_id = s.id "
         "WHERE c.earnings_date BETWEEN %s AND %s ORDER BY c.earnings_date, c.ticker",
         [today, today + timedelta(days=window_days)],
     )
     before = len(rows)
     rows = [r for r in rows if r["earnings_date"] != today or eh.session_from_calendar_hour(r.get("time_of_day")) == eh.AMC]
     retry_hours = min_age_hours if retry_hours is None else retry_hours
-    if min_age_hours > 0 or retry_hours > 0:
-        now = datetime.now(timezone.utc)
+    close_retry_hours = retry_hours if close_retry_hours is None else close_retry_hours
+    now = datetime.now(timezone.utc)
 
-        def recent(r: Dict[str, Any]) -> bool:
-            hours = min_age_hours if r.get("implied_move_pct") is not None else retry_hours
-            stamp = r.get("implied_move_updated_at")
-            return bool(stamp and hours > 0 and _aware(stamp) > now - timedelta(hours=hours))
+    def last_attempt(r: Dict[str, Any]) -> Optional[datetime]:
+        stamp = r.get("implied_move_checked_at") or r.get("implied_move_updated_at")
+        return _aware(stamp) if stamp else None
 
-        rows = [r for r in rows if not recent(r)]
-    logger.info("implied moves: %d of %d reports need a refresh (min age %sh, retry %sh)",
-                len(rows), before, min_age_hours, retry_hours)
-    stored = cleared = kept = failed = streak = 0
+    def wait_hours(r: Dict[str, Any]) -> float:
+        if r.get("implied_move_pct") is not None:
+            return min_age_hours
+        if r.get("implied_move_status") == "no_options":
+            return no_options_retry_hours
+        days_left = (_as_date(r["earnings_date"]) - today).days
+        return close_retry_hours if days_left <= CLOSE_REPORT_DAYS else retry_hours
+
+    def due(r: Dict[str, Any]) -> bool:
+        stamp, hours = last_attempt(r), wait_hours(r)
+        return not (stamp and hours > 0 and stamp > now - timedelta(hours=hours))
+
+    rows = sorted((r for r in rows if due(r)), key=lambda r: (_as_date(r["earnings_date"]), last_attempt(r) is not None))
+    logger.info("implied moves: %d of %d reports need a refresh (min age %sh, retry %sh, near the report %sh)",
+                len(rows), before, min_age_hours, retry_hours, close_retry_hours)
+    started, first_request = time.monotonic(), requests_sent()
+    stored = cleared = kept = failed = streak = done = 0
+    by_status: Dict[str, int] = {}
+    by_method: Dict[str, int] = {}
     aborted: Optional[str] = None
+    stopped: Optional[str] = None
     for row in rows:
+        if max_requests is not None and requests_sent() - first_request >= max_requests:
+            stopped = f"request budget ({max_requests}) used"
+            break
+        if max_minutes is not None and time.monotonic() - started >= max_minutes * 60:
+            stopped = f"time budget ({max_minutes:g} min) used"
+            break
         ticker, report = str(row["ticker"]), row["earnings_date"]
         session = eh.session_from_calendar_hour(row.get("time_of_day"))
         try:
-            result = fetch(ticker, report, session)
+            result = fetch(ticker, report, session, daily_vol=_daily_vol_source(db, row, fetch_bars))
             streak = 0
         except eh.OptionsMarketClosed as exc:
             aborted = f"options market closed at {ticker}: {exc}"
@@ -377,24 +459,42 @@ def refresh_implied_moves(
                 logger.error("implied moves aborted: %s", aborted)
                 break
             continue
-        move = result["implied_move_pct"] if result else None
-        expiry = result["expiry"] if result else None
+        done += 1
+        move = result.get("implied_move_pct") if result else None
+        expiry = result.get("expiry") if result else None
+        method = result.get("method") if move is not None else None
+        status = (result or {}).get("status") or ("ok" if move is not None else "no_reliable_quote")
+        by_status[status] = by_status.get(status, 0) + 1
         if move is None and row.get("implied_move_pct") is not None \
                 and eh.expiry_covers(eh._as_date(row.get("implied_move_expiry")), report, session,
                                      max_days=eh.TERM_MAX_FIRST_EXPIRY_DAYS):
             kept += 1          # a miss never erases an earlier live quote that still covers this report
+            db.execute_raw_sql(
+                "UPDATE public.earnings_calendar SET implied_move_status = %s, implied_move_checked_at = NOW() "
+                "WHERE ticker = %s AND earnings_date = %s",
+                [status, ticker, report],
+            )
             continue
         db.execute_raw_sql(
             "UPDATE public.earnings_calendar SET implied_move_pct = %s, implied_move_expiry = %s, "
+            "implied_move_method = %s, implied_move_status = %s, implied_move_checked_at = NOW(), "
             "implied_move_updated_at = NOW() WHERE ticker = %s AND earnings_date = %s",
-            [move, expiry, ticker, report],
+            [move, expiry, method, status, ticker, report],
         )
-        stored += 1 if move is not None else 0
-        cleared += 1 if move is None else 0
+        if move is not None:
+            stored += 1
+            by_method[method or "unknown"] = by_method.get(method or "unknown", 0) + 1
+        else:
+            cleared += 1
         if pause_seconds:
             time.sleep(pause_seconds)
-    out = {"candidates": len(rows), "stored": stored, "no_reliable_quote": cleared, "kept_previous": kept,
-           "failed": failed}
+    out: Dict[str, Any] = {"candidates": len(rows), "done": done, "stored": stored, "no_reliable_quote": cleared,
+                           "kept_previous": kept, "failed": failed, "requests": requests_sent() - first_request,
+                           "minutes": round((time.monotonic() - started) / 60, 1), "status": by_status,
+                           "method": by_method}
+    if stopped:
+        out["stopped"] = stopped
+        logger.info("implied moves stopped early: %s; %d reports left for the next run", stopped, len(rows) - done - failed)
     if aborted:
         out["aborted"] = aborted
     return out
@@ -413,7 +513,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--no-finnhub", action="store_true", help="skip the Finnhub beat/miss cross-check")
     parser.add_argument("--runup-backfill", action="store_true", help="fill the pre-report run-up columns for stocks that lack them (1 Yahoo call per stock)")
     parser.add_argument("--implied", action="store_true", help="refresh options-implied moves for upcoming reports")
-    parser.add_argument("--window-days", type=int, default=10)
+    parser.add_argument("--window-days", type=int, default=14)
     parser.add_argument("--implied-min-age-hours", type=float, default=0.0, help="skip implied moves attempted within N hours")
     args = parser.parse_args(argv)
 

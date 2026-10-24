@@ -3,10 +3,11 @@
 
 Why a separate job: the stock updater runs only while the US market is closed, and after the close Yahoo returns
 bid = ask = openInterest = 0 on every option contract, so the implied moves it used to compute were NULL 224 times
-out of 232. This job runs a few times per trading day (deploy/azure/deploy_implied_moves_job.sh), only reads option
-chains (two Yahoo requests per upcoming report, paced like the workers) and only writes
-``earnings_calendar.implied_move_*``. The logic lives in the shared ``database/earnings_local_update.py``
-(``run_implied``); this wrapper only adds the exporter's process-wide Yahoo pacer.
+out of 232. This job runs hourly in the session (deploy/azure/deploy_implied_moves_job.sh), only reads option
+chains (~2.5 Yahoo requests per upcoming report, paced like the workers; at most 1,000 per run and 3,500 per New York
+day, counted by the pacer) and only writes ``earnings_calendar.implied_move_*``. The logic lives in the shared
+``database/earnings_local_update.py`` (``run_implied``); this wrapper only adds the exporter's process-wide Yahoo
+pacer, whose request count the run reports to ``cron_runs``.
 
     python database/implied_moves_job.py            # exits at once outside 09:45-15:45 New York on trading days
 """

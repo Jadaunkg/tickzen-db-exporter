@@ -63,6 +63,13 @@ TERM_MAX_CHAINS = 4                     # chains tried for the two (an illiquid 
 MIN_STRADDLE_OPEN_INTEREST = 100        # call OI + put OI at the chosen strike
 MAX_RELATIVE_SPREAD = 0.35              # (ask - bid) / mid per leg
 MAX_IMPLIED_MOVE_PCT = 60.0
+# Single-expiry fallback (monthly options where only one expiry passes the quote gates, e.g. PSA or XPO when the
+# December chain is thin): the straddle minus the stock's own normal movement over the other sessions to expiry.
+STRADDLE_PER_SD = math.sqrt(2.0 / math.pi)   # ATM straddle / spot ~= 0.798 x the standard deviation to expiry
+SINGLE_VOL_MULTIPLIER = 1.0             # implied / realised normal volatility assumed by the fallback
+SINGLE_MIN_EVENT_SHARE = 0.2            # the earnings part must be at least this share of the straddle's variance
+DAILY_VOL_SESSIONS = 60                 # daily changes used for the normal volatility
+DAILY_VOL_MIN_CHANGES = 40              # fewer usable changes -> no normal volatility
 
 
 # --------------------------------------------------------------------------- small helpers
@@ -488,6 +495,52 @@ def event_move_from_term_structure(near_move: Optional[float], near_days: int,
     return round(move, 4), "ok"
 
 
+def normal_daily_vol(bars: Sequence[Bar], exclude: Iterable[Any] = (), sessions: int = DAILY_VOL_SESSIONS) -> Optional[float]:
+    """Standard deviation (percent points) of the last ``sessions`` daily close-to-close changes, leaving out the
+    sessions in ``exclude`` (report reactions: the normal movement must not contain the jumps it is subtracted from).
+    None with fewer than ``DAILY_VOL_MIN_CHANGES`` usable changes."""
+    skip = {d for d in (_as_date(x) for x in exclude) if d is not None}
+    ordered = normalize_bars(bars)
+    changes = [(cur["close"] / prev["close"] - 1.0) * 100.0
+               for prev, cur in zip(ordered, ordered[1:]) if cur["date"] not in skip][-sessions:]
+    changes = [c for c in changes if abs(c) <= MAX_ABS_REACTION_PCT]
+    if len(changes) < DAILY_VOL_MIN_CHANGES:
+        return None
+    mean = sum(changes) / len(changes)
+    return round(math.sqrt(sum((c - mean) ** 2 for c in changes) / (len(changes) - 1)), 4)
+
+
+def trading_sessions(after: date, through: date) -> int:
+    """NYSE sessions in (after, through]."""
+    from database.updater_schedule import is_trading_day
+
+    return sum(1 for i in range(1, (through - after).days + 1) if is_trading_day(after + timedelta(days=i)))
+
+
+def event_move_from_single_expiry(move: Optional[float], sessions: int,
+                                  daily_vol: Optional[float]) -> Tuple[Optional[float], str]:
+    """Earnings-only move (percent points, straddle units like ``event_move_from_term_structure``) from one straddle
+    that holds the report plus ``sessions`` ordinary sessions: m^2 = (0.798 * s * daily_vol)^2 * sessions + E^2.
+
+    An estimate: the ordinary part comes from the stock's past movement (``s`` = ``SINGLE_VOL_MULTIPLIER``), not
+    from a second option price, so it is only used when no second expiry can be quoted and is published as such."""
+    m, vol = finite(move), finite(daily_vol)
+    if vol is None or vol <= 0:
+        return None, "no_daily_vol"
+    if m is None or m <= 0 or sessions < 0:
+        return None, "no_term_structure"
+    normal_sq = (STRADDLE_PER_SD * SINGLE_VOL_MULTIPLIER * vol) ** 2 * sessions
+    event_sq = m * m - normal_sq
+    if event_sq <= 0:
+        return None, "no_event_premium"
+    if event_sq < SINGLE_MIN_EVENT_SHARE * m * m:
+        return None, "small_event_premium"     # mostly ordinary movement: the remainder is noise
+    event = math.sqrt(event_sq)
+    if event > MAX_IMPLIED_MOVE_PCT:
+        return None, "implausible_move"
+    return round(event, 4), "ok"
+
+
 # --------------------------------------------------------------------------- stats (shared read-side logic)
 def summarize_history(rows: Sequence[Dict[str, Any]], *, limit: int = 12) -> Dict[str, Any]:
     """Aggregate the last ``limit`` reported quarters (rows newest-first or any order).
@@ -622,7 +675,30 @@ def _direction(surprise: Optional[float]) -> int:
     return 1 if surprise >= INLINE_BAND_PCT else -1 if surprise <= -INLINE_BAND_PCT else 0
 
 
-def flag_source_conflicts(records: List[Dict[str, Any]], finnhub_rows: Sequence[Dict[str, Any]]) -> int:
+REIT_ACTUAL_GAP_USD = 0.03         # REIT quarters: EPS actuals further apart than this...
+REIT_ACTUAL_GAP_SHARE = 0.10       # ...and than this share of the larger one are different measures, not a result
+_REIT_TICKERS: Optional[frozenset] = None
+
+
+def is_reit(ticker: Optional[str]) -> bool:
+    """Listed REIT (SEC SIC 6798 + a few filed elsewhere), from earnings_reports/reit_tickers.json
+    (scripts/build_reit_list.py)."""
+    global _REIT_TICKERS
+    if _REIT_TICKERS is None:
+        import json
+        from pathlib import Path
+
+        path = Path(__file__).with_name("reit_tickers.json")
+        try:
+            _REIT_TICKERS = frozenset(json.loads(path.read_text(encoding="utf-8"))["tickers"])
+        except (OSError, ValueError, KeyError) as exc:
+            logger.warning("REIT list unavailable (%s): REIT rules are off", exc)
+            _REIT_TICKERS = frozenset()
+    return bool(ticker) and ticker.upper() in _REIT_TICKERS
+
+
+def flag_source_conflicts(records: List[Dict[str, Any]], finnhub_rows: Sequence[Dict[str, Any]], *,
+                          strict_actuals: bool = False) -> int:
     """Set ``eps_source_conflict`` on records whose beat/miss direction Finnhub contradicts.
 
     Every quarter Finnhub covers is re-decided from this fresh evidence (a stale flag can clear);
@@ -630,6 +706,11 @@ def flag_source_conflicts(records: List[Dict[str, Any]], finnhub_rows: Sequence[
 
     Quarters are matched by fiscal period end -> report date (reports land 15-80 days after the period).
     A conflict needs *opposite* directions outside the in-line band; "beat vs in line" is not a conflict.
+    ``strict_actuals`` (REITs): the reported EPS itself must also agree, within the larger of
+    ``REIT_ACTUAL_GAP_USD`` and ``REIT_ACTUAL_GAP_SHARE``.  Yahoo mixes GAAP and a normalised EPS for REITs while
+    Finnhub reports GAAP, so a "miss" can compare two different measures (WELL 2026-07-27: Yahoo 0.54 against a
+    0.65 GAAP estimate, GAAP actual 0.61).  Not used for other stocks: there Yahoo's estimate and actual are both
+    adjusted and agree with each other, and a GAAP gap flagged 24 % of their quarters (sample of 60, 2026-10-24).
     Returns the number of flagged records.
     """
     flagged = 0
@@ -646,8 +727,13 @@ def flag_source_conflicts(records: List[Dict[str, Any]], finnhub_rows: Sequence[
         if best is None:
             continue
         a, b = _direction(finite(best.get("eps_surprise_pct"))), _direction(fh_surprise)
-        best["eps_source_conflict"] = a * b < 0
-        flagged += 1 if best["eps_source_conflict"] else 0
+        conflict = a * b < 0
+        if strict_actuals and not conflict:
+            ours, theirs = finite(best.get("eps_actual")), finite(fh_row.get("actual"))
+            if ours is not None and theirs is not None:
+                conflict = abs(ours - theirs) > max(REIT_ACTUAL_GAP_USD, REIT_ACTUAL_GAP_SHARE * max(abs(ours), abs(theirs)))
+        best["eps_source_conflict"] = conflict
+        flagged += 1 if conflict else 0
     return flagged
 
 
@@ -662,6 +748,13 @@ def is_rate_limited(exc: BaseException) -> bool:
 
 
 YAHOO_BACKOFFS = (30.0, 90.0, 240.0)
+_yahoo_requests = 0
+
+
+def yahoo_requests_sent() -> int:
+    """Yahoo requests started through ``yahoo_call`` by this process (retries included).  yfinance can add a
+    cookie request of its own; the exporter's HTTP-level pacer counts those too."""
+    return _yahoo_requests
 
 
 def yahoo_call(fn: Callable[..., Any], *args: Any, limiter: Optional[Any] = None,
@@ -671,9 +764,11 @@ def yahoo_call(fn: Callable[..., Any], *args: Any, limiter: Optional[Any] = None
     Every provider request goes through here (one limiter slot per request).  Non rate-limit errors
     propagate unchanged (a bad ticker is the caller's business); persistent 429 raises ProviderThrottled.
     """
+    global _yahoo_requests
     lim = limiter or get_limiter("yahoo")
     for attempt in range(len(backoffs) + 1):
         lim.wait()
+        _yahoo_requests += 1
         try:
             return fn(*args, **kwargs)
         except Exception as exc:  # noqa: BLE001
@@ -722,8 +817,11 @@ def fetch_bars(ticker: str, years: int = 6, **call_kwargs: Any) -> List[Bar]:
 
 
 def fetch_implied_move(ticker: str, report: date, session: Optional[str], *, today: Optional[date] = None,
-                       **call_kwargs: Any) -> Optional[Dict[str, Any]]:
-    """Implied move for an upcoming report: {implied_move_pct, expiry, method} or None.
+                       daily_vol: Optional[Callable[[], Optional[float]]] = None,
+                       **call_kwargs: Any) -> Dict[str, Any]:
+    """Implied move for an upcoming report: {implied_move_pct, expiry, method, status}.  On a miss the move,
+    expiry and method are None and ``status`` names the reason (``no_options``, ``no_usable_expiry`` or the gate
+    that rejected the last chain tried, e.g. ``wide_spread``); ``status`` is "ok" otherwise.
 
     ``method`` "straddle": the ATM straddle of the first expiry within ``MAX_EXPIRY_AFTER_REACTION_DAYS`` of
     the reaction (two Yahoo requests: expiry list + chain; the spot comes with the chain).
@@ -731,11 +829,17 @@ def fetch_implied_move(ticker: str, report: date, session: Optional[str], *, tod
     after the October monthly) or its straddle fails a quote gate, the earnings-only move is separated from
     two later expiries that both contain the report (``event_move_from_term_structure``; one or two more
     chain requests).  ``expiry`` is then the first of the two.
+    ``method`` "single_expiry": when only one of those expiries can be quoted, its straddle minus the stock's
+    normal movement over the other sessions (``event_move_from_single_expiry``).  ``daily_vol`` supplies that
+    normal movement and is only called in this case (it may cost one price-history request).
 
     Raises ``OptionsMarketClosed`` when a chain's ``marketState`` is not ``REGULAR``: before the open Yahoo
     reports bid = ask = openInterest = 0 on every contract (checked on NFLX, META, SPOT and GE at 05:30 New
     York on 2026-10-16), so the caller should stop rather than record a miss for every report."""
     import yfinance as yf
+
+    def miss(reason: str) -> Dict[str, Any]:
+        return {"implied_move_pct": None, "expiry": None, "method": None, "status": reason}
 
     handle = yf.Ticker(ticker)
     chains: Dict[date, Any] = {}
@@ -752,36 +856,60 @@ def fetch_implied_move(ticker: str, report: date, session: Optional[str], *, tod
                               chain.calls.to_dict("records"), chain.puts.to_dict("records"))
 
     expiries = list(yahoo_call(lambda: handle.options, **call_kwargs) or [])
+    if not expiries:
+        return miss("no_options")
+    reason = "no_usable_expiry"
     expiry = pick_expiry(expiries, report, session)
     if expiry is not None:
         move, reason = straddle(expiry)
         if move is not None:
-            return {"implied_move_pct": move, "expiry": expiry, "method": "straddle"}
+            return {"implied_move_pct": move, "expiry": expiry, "method": "straddle", "status": "ok"}
         logger.info("implied move %s (expiry %s) rejected: %s; trying the term structure", ticker, expiry, reason)
 
+    quoted = today or datetime.now(_NEW_YORK).date()
+    reaction_day = _reaction_day(report, session)
     candidates = pick_term_expiries(expiries, report, session, skip=expiry)
+    if not candidates:
+        # Fewer than two expiries hold the report: a lone monthly can still give the single-expiry estimate.
+        candidates = [d for d in sorted(_as_date(raw) for raw in expiries if _as_date(raw) is not None)
+                      if d != expiry and 0 <= (d - reaction_day).days <= TERM_MAX_FIRST_EXPIRY_DAYS][:1]
     if not candidates:
         logger.info("implied move %s: no usable expiry (none within %s days of the reaction, no term structure)",
                     ticker, MAX_EXPIRY_AFTER_REACTION_DAYS)
-        return None
+        return miss(reason)
     quoted_pair: List[Tuple[date, float]] = []
     for i, candidate in enumerate(candidates):
-        if len(quoted_pair) == 2 or len(candidates) - i < 2 - len(quoted_pair):
-            break                                   # done, or too few candidates left to finish the pair
+        if len(quoted_pair) == 2:
+            break
+        if not quoted_pair and len(candidates) - i < 2 \
+                and (candidate - reaction_day).days > TERM_MAX_FIRST_EXPIRY_DAYS:
+            break                                   # too far to stand alone and nothing left to pair it with
         candidate_move, candidate_reason = straddle(candidate)
         if candidate_move is None:
+            reason = candidate_reason
             logger.info("implied move %s (term expiry %s) rejected: %s", ticker, candidate, candidate_reason)
             continue
         quoted_pair.append((candidate, candidate_move))
-    if len(quoted_pair) < 2:
-        return None
-    (near, near_move), (far, far_move) = sorted(quoted_pair)
-    if (near - _reaction_day(report, session)).days > TERM_MAX_FIRST_EXPIRY_DAYS:
-        logger.info("implied move %s: nearest quoted term expiry %s is too far from the report", ticker, near)
-        return None
-    quoted = today or datetime.now(_NEW_YORK).date()
-    move, reason = event_move_from_term_structure(near_move, (near - quoted).days, far_move, (far - quoted).days)
-    if move is None:
-        logger.info("implied move %s (term %s/%s: %.2f%%/%.2f%%) rejected: %s", ticker, near, far, near_move, far_move, reason)
-        return None
-    return {"implied_move_pct": move, "expiry": near, "method": "term_structure"}
+
+    if len(quoted_pair) == 2:
+        (near, near_move), (far, far_move) = sorted(quoted_pair)
+        if (near - reaction_day).days > TERM_MAX_FIRST_EXPIRY_DAYS:
+            logger.info("implied move %s: nearest quoted term expiry %s is too far from the report", ticker, near)
+            return miss("no_usable_expiry")
+        move, reason = event_move_from_term_structure(near_move, (near - quoted).days, far_move, (far - quoted).days)
+        if move is None:
+            logger.info("implied move %s (term %s/%s: %.2f%%/%.2f%%) rejected: %s", ticker, near, far, near_move, far_move, reason)
+            return miss(reason)                     # the market itself prices no separate event: no estimate either
+        return {"implied_move_pct": move, "expiry": near, "method": "term_structure", "status": "ok"}
+
+    if len(quoted_pair) == 1 and (quoted_pair[0][0] - reaction_day).days <= TERM_MAX_FIRST_EXPIRY_DAYS:
+        near, near_move = quoted_pair[0]
+        vol = daily_vol() if daily_vol is not None else None
+        # Ordinary sessions the straddle also holds: every session to expiry except the reaction session.
+        move, single_reason = event_move_from_single_expiry(near_move, trading_sessions(quoted, near) - 1, vol)
+        if move is not None:
+            return {"implied_move_pct": move, "expiry": near, "method": "single_expiry", "status": "ok"}
+        logger.info("implied move %s (single %s: %.2f%%, daily vol %s) rejected: %s",
+                    ticker, near, near_move, vol, single_reason)
+        return miss(single_reason)
+    return miss(reason)

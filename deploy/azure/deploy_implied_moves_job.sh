@@ -6,11 +6,13 @@
 #
 # Why: options-implied earnings moves need live option quotes. After the close Yahoo returns bid = ask =
 # openInterest = 0 on every contract, so the nightly updater (which only runs while the market is closed) stored NULL
-# for 224 of 232 reports. This job runs database/implied_moves_job.py at 15:15, 17:15 and 19:15 UTC on weekdays
-# (11:15 / 13:15 / 15:15 New York in summer, 10:15 / 12:15 / 14:15 in winter; all inside the 09:45-15:45 window the
-# code checks, holidays included). It only reads option chains (2 paced Yahoo requests per report in the next
-# 10 days) and only writes earnings_calendar.implied_move_*. The first run quotes every report; the next two retry
-# the ones without a reliable quote; a stored move is re-quoted once a day.
+# for 224 of 232 reports. This job runs database/implied_moves_job.py at :15 past every hour 13-20 UTC on weekdays;
+# the code only works inside 09:45-15:45 New York (holidays included), so 6 runs a day do work - 10:15 ... 15:15 New
+# York in summer and winter alike - and the others exit at once. It only reads option chains (~2.5 paced Yahoo
+# requests per report in the next 14 days) and only writes earnings_calendar.implied_move_*. Each run stops cleanly
+# after 50 minutes or 1,000 Yahoo requests, and all runs of a New York day share 3,500 requests (counted in
+# cron_runs). Nearest reports go first; a stored move is re-quoted once a day, a thin or wide quote is retried once a
+# day (every other run in the last 3 days before the report), a stock with no listed options once a week.
 #
 # It reuses the image and Container Apps environment of the workers (deploy_container_apps_job.sh), whose IP is idle
 # during market hours. Deploy the workers first so the image contains database/implied_moves_job.py; this script
@@ -25,7 +27,7 @@ IMAGE_REPO="tickzen-db-exporter"
 LOCATION="${LOCATION:-centralindia}"
 ENV_NAME="${ENV_NAME:-tickzen-exporter-${LOCATION}}"
 JOB_NAME="${JOB_NAME:-tickzen-implied-moves}"
-CRON_EXPRESSION="${CRON_EXPRESSION:-15 15,17,19 * * 1-5}"     # UTC; the job itself checks the New York session
+CRON_EXPRESSION="${CRON_EXPRESSION:-15 13-20 * * 1-5}"       # UTC; the job itself checks the New York session
 REPLICA_TIMEOUT_SECONDS="${REPLICA_TIMEOUT_SECONDS:-3600}"
 YAHOO_REQUESTS_PER_HOUR="${YAHOO_REQUESTS_PER_HOUR:-1200}"
 
