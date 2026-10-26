@@ -44,7 +44,7 @@ from database.data_mapper import DataMapper
 from Models.forecast_core import PIPELINE_VERSION as TICKZEN_PROPHET_PIPELINE_VERSION
 from database.supabase_client import SupabaseClient
 from analysis_scripts.risk_analysis import RiskAnalyzer
-from data_processing_scripts.trading_sessions import session_indicator_frame, trading_rows
+from data_processing_scripts.trading_sessions import market_date, session_indicator_frame, trading_rows
 from database.financial_contract import (
     SCHEMA_VERSION,
     CALCULATION_VERSION,
@@ -1148,6 +1148,8 @@ class SupabaseDataExporter:
                 # 2.7a: Export liquidity risk data
                 liquidity_record = self.mapper.map_liquidity_risk_data(stock_id, metrics)
                 if liquidity_record:
+                    liquidity_record["date"] = market_date(risk_sessions)  # same trading day as risk_data
+                if liquidity_record:
                     self.db.client.table('liquidity_risk_data').upsert(
                         [liquidity_record],
                         on_conflict='stock_id,date'
@@ -1173,6 +1175,8 @@ class SupabaseDataExporter:
                 
                 # 2.7c: Export regime risk data
                 regime_record = self.mapper.map_regime_risk_data(stock_id, metrics)
+                if regime_record:
+                    regime_record["date"] = market_date(risk_sessions)  # same trading day as risk_data
                 if regime_record:
                     self.db.client.table('regime_risk_data').upsert(
                         [regime_record],

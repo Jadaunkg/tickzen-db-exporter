@@ -16,8 +16,31 @@ from typing import Optional
 import pandas as pd
 
 OHLCV = ['Open', 'High', 'Low', 'Close', 'Volume']
-# Recent sessions used to widen the vendor's 52-week range (older rows are dividend-adjusted, so lower than traded).
+TRADING_DAYS_PER_YEAR = 252
+# A frame with at least this many sessions covers (nearly) a year: its own 52-week range is used.
+MIN_SESSIONS_FOR_OWN_RANGE = 240
+# With less history, the vendor range is widened by the most recent sessions.
 RANGE_GUARD_SESSIONS = 30
+MARKET_TZ = 'America/New_York'
+
+
+def market_date(sessions: Optional[pd.DataFrame], quote: Optional[dict] = None) -> str:
+    """
+    The trading day a price belongs to, as YYYY-MM-DD. The quote's own market time when the provider gives one, else
+    the newest session in the frame, else today in New York. Never the machine's clock: the Azure workers run on
+    Asia/Kolkata time, so a Friday close written at 21:50 UTC was stored as Saturday's row.
+    """
+    ts = (quote or {}).get('market_time')
+    if ts:
+        try:
+            return pd.Timestamp(int(ts), unit='s', tz='UTC').tz_convert(MARKET_TZ).strftime('%Y-%m-%d')
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if sessions is not None and not getattr(sessions, 'empty', True) and 'Date' in sessions.columns:
+        last = pd.to_datetime(sessions['Date'], errors='coerce').max()
+        if pd.notna(last):
+            return last.strftime('%Y-%m-%d')
+    return pd.Timestamp.now(tz=MARKET_TZ).strftime('%Y-%m-%d')
 
 
 def trading_rows(frame: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
@@ -49,10 +72,12 @@ def session_indicator_frame(processed: Optional[pd.DataFrame]) -> Optional[pd.Da
     return kept.merge(recomputed[['Date'] + indicator_cols], on='Date', how='inner')
 
 
-def widened_52w_range(sessions: Optional[pd.DataFrame], vendor_high, vendor_low):
+def range_52w(sessions: Optional[pd.DataFrame], vendor_high, vendor_low):
     """
-    Vendor 52-week high/low (refreshed about monthly) widened by the last RANGE_GUARD_SESSIONS sessions, so a new high
-    made since the vendor refresh is never missing (AAPL: vendor 348.15 while it traded at 351.73).
+    52-week high/low from the daily highs and lows of the last 252 sessions: the same price series the charts draw.
+    The vendor value lags (refreshed about monthly): NVDA kept 236.54 while it traded up to 243.37, and kept an expired
+    low of 138.83 when the real 52-week low was 151.29. With less than a year of sessions (a recent listing, a short
+    frame) the vendor value is used, widened by the sessions we have so a new high is never missing.
     """
     def _num(v):
         try:
@@ -64,6 +89,12 @@ def widened_52w_range(sessions: Optional[pd.DataFrame], vendor_high, vendor_low)
     high, low = _num(vendor_high), _num(vendor_low)
     if sessions is None or getattr(sessions, 'empty', True):
         return high, low
+    if len(sessions) >= MIN_SESSIONS_FOR_OWN_RANGE:
+        year = sessions.tail(TRADING_DAYS_PER_YEAR)
+        own_high = pd.to_numeric(year.get('High'), errors='coerce').max() if 'High' in year else None
+        own_low = pd.to_numeric(year.get('Low'), errors='coerce').min() if 'Low' in year else None
+        if own_high is not None and pd.notna(own_high) and own_high > 0 and own_low is not None and pd.notna(own_low) and own_low > 0:
+            return float(own_high), float(own_low)
     recent = sessions.tail(RANGE_GUARD_SESSIONS)
     recent_high = pd.to_numeric(recent.get('High'), errors='coerce').max() if 'High' in recent else None
     recent_low = pd.to_numeric(recent.get('Low'), errors='coerce').min() if 'Low' in recent else None

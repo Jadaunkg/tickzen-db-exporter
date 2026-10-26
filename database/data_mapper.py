@@ -29,7 +29,7 @@ from datetime import datetime, date, timezone
 from typing import Dict, List, Any, Optional, Tuple
 import logging
 
-from data_processing_scripts.trading_sessions import trading_rows, widened_52w_range
+from data_processing_scripts.trading_sessions import market_date, range_52w, trading_rows
 from database.financial_contract import (
     SCHEMA_VERSION,
     PartialProviderData,
@@ -45,6 +45,49 @@ from database.financial_contract import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Words that name no particular company: a headline containing "Corporation" or "Bank" is not about every
+# "... Corporation" or "... Bank".
+_GENERIC_NAME_WORDS = {
+    'INC', 'INCORPORATED', 'CORP', 'CORPORATION', 'CO', 'COMPANY', 'COMPANIES', 'LTD', 'LIMITED', 'PLC', 'LLC', 'LP',
+    'HOLDING', 'HOLDINGS', 'GROUP', 'THE', 'AND', 'CLASS', 'COMMON', 'STOCK', 'SHARES', 'ADR', 'NV', 'SA', 'AG', 'SE',
+    'INTERNATIONAL', 'GLOBAL', 'AMERICA', 'AMERICAN', 'NATIONAL', 'UNITED', 'FIRST', 'BANK', 'BANCORP', 'FINANCIAL',
+    'TRUST', 'CAPITAL', 'PARTNERS', 'TECHNOLOGY', 'TECHNOLOGIES', 'SYSTEMS', 'SERVICES', 'INDUSTRIES', 'ENERGY',
+    'COMMUNICATIONS', 'PHARMACEUTICALS', 'THERAPEUTICS', 'RESOURCES', 'ENTERPRISES', 'SOLUTIONS', 'MANUFACTURING',
+}
+
+
+def issuer_mentioned(title, summary, ticker, company_name, related=None) -> bool:
+    """
+    True when an article is about the issuer: its title or summary names the ticker (as written, upper case) or the
+    company (its full short name, or the first word of it when that word is distinctive: "NVIDIA", "Apple"). Yahoo's
+    relatedTickers alone is not enough, except when the issuer is the only ticker tagged.
+    """
+    text = f"{title or ''} {summary or ''}"
+    upper = text.upper()
+    symbol = str(ticker or '').strip().upper()
+    # Tickers are case-sensitive in headlines ("Corning (GLW)"); "ALL" must not match the word "all".
+    if symbol and re.search(rf"(?<![A-Za-z0-9.]){re.escape(symbol)}(?![A-Za-z0-9])", text):
+        return True
+    if company_name:
+        core = [w for w in re.split(r"[^A-Z0-9&'-]+", str(company_name).upper()) if w]
+        if core and core[0] == 'THE':
+            core = core[1:]
+        while core and core[-1] in _GENERIC_NAME_WORDS:
+            core.pop()  # drop legal suffixes: "MICROSOFT CORPORATION" -> "MICROSOFT", "BANK OF AMERICA CORPORATION" -> "BANK OF AMERICA"
+        names = []
+        if core:
+            names.append(' '.join(core))
+            if len(core[0]) >= 4 and core[0] not in _GENERIC_NAME_WORDS:
+                names.append(core[0])
+        for name in names:
+            if re.search(rf"(?<![A-Z0-9]){re.escape(name)}(?![A-Z0-9])", upper):
+                return True
+    if isinstance(related, (list, tuple)):
+        tagged = {str(t).strip().upper() for t in related if str(t).strip()}
+        return bool(symbol) and tagged == {symbol}
+    return False
+
 
 # Forecast horizons closer than this are the same horizon (see map_forecast_data).
 MIN_FORECAST_HORIZON_GAP_DAYS = 7
@@ -1088,8 +1131,9 @@ class DataMapper:
             # Build complete record with all fields
             record = {
                 'stock_id': stock_id,
-                'date': datetime.now().strftime('%Y-%m-%d'),
-                
+                # the trading day of the prices measured, not the worker's (Asia/Kolkata) clock
+                'date': market_date(trading_rows(processed_data)),
+
                 # === BASE METRICS ===
                 'var_95': safe_float_conversion(metrics.get('var_5')),
                 'var_99': safe_float_conversion(metrics.get('var_1')),
@@ -1333,7 +1377,7 @@ class DataMapper:
 
             # Calculate from_52wk_high_pct & from_52wk_low_pct. The vendor range is refreshed about monthly; recent
             # sessions widen it so a new high is never missing (AAPL stored 348.15 after trading at 351.73).
-            high_52w, low_52w = widened_52w_range(
+            high_52w, low_52w = range_52w(
                 sessions, safe_float_conversion(info.get('fiftyTwoWeekHigh')), safe_float_conversion(info.get('fiftyTwoWeekLow'))
             )
             from_52wk_high_pct = None
@@ -1421,7 +1465,8 @@ class DataMapper:
 
             record = {
                 'stock_id': stock_id,
-                'date': datetime.now().strftime('%Y-%m-%d'),
+                # the trading day this price belongs to (quote time, else newest session), not the worker's clock
+                'date': market_date(sessions, current_price),
 
                 # Current Price & Changes (published_price is real-time when available)
                 'current_price': safe_float_conversion(published_price),
@@ -1667,9 +1712,17 @@ class DataMapper:
             Dict ready for ownership_data table
         """
         try:
+            # The exchange's short-interest settlement date (dateShortInterest), not the day we fetched it; the
+            # fetch day in New York only when the provider gives no date.
+            short_date = None
+            if info.get('dateShortInterest'):
+                try:
+                    short_date = pd.Timestamp(int(info['dateShortInterest']), unit='s', tz='UTC').strftime('%Y-%m-%d')
+                except (TypeError, ValueError, OverflowError):
+                    short_date = None
             record = {
                 'stock_id': stock_id,
-                'report_date': datetime.now().strftime('%Y-%m-%d'),
+                'report_date': short_date or market_date(None),
                 
                 # Ownership percentages
                 # Legacy table contract is percentage points. Validate provider
@@ -2268,30 +2321,10 @@ class DataMapper:
                     if 'datetime' in article:  # Finnhub uses 'datetime'
                         source_api = 'finnhub'
                     
-                    # Reject broad market headlines that carry no explicit
-                    # issuer signal. This prevents false ticker sentiment.
-                    import re
-                    issuer_tokens = [str(ticker or '').strip().upper()]
-                    if company_name:
-                        normalized_company = str(company_name).strip().upper()
-                        issuer_tokens.append(normalized_company)
-                        # Headlines commonly use the short issuer name rather
-                        # than the legal suffix ("Apple" vs "Apple Inc.").
-                        issuer_tokens.extend(
-                            part for part in re.split(r"[^A-Z0-9]+", normalized_company)
-                            if len(part) >= 4 and part not in {"INC", "CORP", "LTD", "PLC", "COMPANY"}
-                        )
-                    article_text = f"{title} {summary or ''}".upper()
+                    # Keep only articles about this issuer (see issuer_mentioned): Yahoo tags mega-caps such as
+                    # NVDA as "related" on market wraps and other companies' earnings calls.
                     related = article.get('relatedTickers') or article.get('related_tickers') or []
-                    related_text = ' '.join(str(value).upper() for value in related) if isinstance(related, (list, tuple)) else str(related).upper()
-                    explicit_match = any(
-                        token and (
-                            re.search(rf"(?<![A-Z0-9]){re.escape(token)}(?![A-Z0-9])", article_text)
-                            or re.search(rf"(?<![A-Z0-9]){re.escape(token)}(?![A-Z0-9])", related_text)
-                        )
-                        for token in issuer_tokens
-                    )
-                    if not explicit_match:
+                    if not issuer_mentioned(title, summary, ticker, company_name, related):
                         skipped_count += 1
                         logger.info("  📰 Article %s: skipped as irrelevant to %s", i, ticker or company_name)
                         continue
@@ -2306,7 +2339,7 @@ class DataMapper:
                         'published_date': published_date,
                         'sentiment_score': None,  # Can be populated by sentiment analysis later
                         'sentiment_label': None,
-                        'relevance_score': 1.0,  # Default to high relevance for stock-specific news
+                        'relevance_score': None,  # nothing measures relevance; a constant 1.0 was not a measurement
                         'category': category,
                         'source_api': source_api,
                         'created_at': datetime.now().isoformat(),

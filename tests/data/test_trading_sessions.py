@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from data_processing_scripts.trading_sessions import session_indicator_frame, trading_rows, widened_52w_range
+from data_processing_scripts.trading_sessions import range_52w, session_indicator_frame, trading_rows
 from database.data_mapper import DataMapper
 
 
@@ -51,23 +51,22 @@ def test_the_calendar_frame_understates_volatility_this_is_the_bug_fixed():
     assert calendar_vol < session_vol * 0.9
 
 
-def test_52_week_range_is_widened_by_recent_sessions_only():
-    s = _sessions()
+def test_52_week_range_short_history_widens_the_vendor_value_with_recent_sessions():
+    s = _sessions(120)  # less than a year of sessions
     recent_high = float(s["High"].tail(30).max())
-    high, low = widened_52w_range(s, recent_high - 5, 1.0)
+    high, low = range_52w(s, recent_high - 5, 1.0)
     assert high == pytest.approx(recent_high)  # a new high since the vendor refresh is not missed
-    assert low == 1.0  # the vendor's real traded low is kept
-    assert widened_52w_range(s, None, None) == (None, None)  # no vendor range: nothing is invented
-    assert widened_52w_range(None, 348.15, 243.42) == (348.15, 243.42)
+    assert low == 1.0  # the vendor's traded low is kept
+    assert range_52w(s, None, None) == (None, None)  # no vendor range and no year of data: nothing is invented
+    assert range_52w(None, 348.15, 243.42) == (348.15, 243.42)
 
 
-def test_market_snapshot_uses_the_widened_range_and_session_counts():
+def test_market_snapshot_uses_a_year_of_sessions_and_session_counts():
     s = _sessions(400)
     filled = _calendar_filled(s)
-    recent_high = float(s["High"].tail(30).max())
-    info = {"fiftyTwoWeekHigh": recent_high - 3, "fiftyTwoWeekLow": 50.0}
+    info = {"fiftyTwoWeekHigh": 1.0, "fiftyTwoWeekLow": 0.5}  # stale vendor values are not used
     record = DataMapper().map_market_snapshot(1, {"current_price": float(s["Close"].iloc[-1])}, info, filled)
-    assert record["high_52w"] == pytest.approx(recent_high)
-    assert record["low_52w"] == 50.0
+    assert record["high_52w"] == pytest.approx(float(s["High"].tail(252).max()))
+    assert record["low_52w"] == pytest.approx(float(s["Low"].tail(252).min()))
     year_ago = float(s["Close"].iloc[-252])
     assert record["change_52w_pct"] == pytest.approx((float(s["Close"].iloc[-1]) - year_ago) / year_ago * 100, abs=0.01)

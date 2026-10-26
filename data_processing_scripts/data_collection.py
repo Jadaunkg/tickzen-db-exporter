@@ -1041,6 +1041,8 @@ def get_current_market_price(ticker, timeout=10):
             'change_percent': change_percent,
             'market_state': market_state,
             'last_updated': last_updated,
+            # epoch of the quote's last trade: the trading day it belongs to (market_price_snapshot.date)
+            'market_time': info.get('regularMarketTime'),
             'currency': info.get('currency', 'USD')
         }
         
