@@ -246,10 +246,10 @@ def check_forecast_integrity(query: Query, expected_version: Optional[str] = Non
         out["invalid_prices"].append(f"{row['symbol']} {row['period_end']}: low/base/high = {row['low_price']}/{row['base_price']}/{row['high_price']}")
     for row in query(
         "SELECT s.symbol, COUNT(f.id) AS n FROM stocks s JOIN forecast_data f ON f.stock_id = s.id "
-        "GROUP BY s.symbol HAVING COUNT(f.id) < 12",
+        "GROUP BY s.symbol HAVING COUNT(f.id) < 11",  # 11 when the 1-session final month is dropped
         None,
     ):
-        out["incomplete"].append(f"{row['symbol']}: {row['n']} of 12 monthly forecast rows")
+        out["incomplete"].append(f"{row['symbol']}: {row['n']} monthly forecast rows (need 11)")
     for row in query(
         "SELECT s.symbol, f.model_version FROM forecast_data f JOIN stocks s ON s.id = f.stock_id "
         "WHERE f.model_version IS DISTINCT FROM %s GROUP BY s.symbol, f.model_version",

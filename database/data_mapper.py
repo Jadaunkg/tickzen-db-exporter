@@ -29,6 +29,7 @@ from datetime import datetime, date, timezone
 from typing import Dict, List, Any, Optional, Tuple
 import logging
 
+from data_processing_scripts.trading_sessions import trading_rows, widened_52w_range
 from database.financial_contract import (
     SCHEMA_VERSION,
     PartialProviderData,
@@ -44,6 +45,11 @@ from database.financial_contract import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Forecast horizons closer than this are the same horizon (see map_forecast_data).
+MIN_FORECAST_HORIZON_GAP_DAYS = 7
+# Months a complete batch has: 12, or 11 when the final one-session month is dropped as a near-copy.
+MIN_FORECAST_MONTHS = 11
 
 
 def safe_float_conversion(value, max_value=None):
@@ -433,6 +439,11 @@ class DataMapper:
                 period = int((period_end.normalize() - anchor_date.normalize()).days)
                 if period <= 0 or period in seen_periods:
                     logger.warning("Skipping forecast row with invalid/duplicate horizon: %r", period_label)
+                    continue
+                # A bucket within a week of the previous one (the 1-session month 2027-10-01 right after 2027-09-30)
+                # is a near-copy of that row, not a new horizon: the page showed Sep and Oct 2027 with equal prices.
+                if any(abs(period - p) < MIN_FORECAST_HORIZON_GAP_DAYS for p in seen_periods):
+                    logger.info("Skipping forecast row %r: within a week of another horizon", period_label)
                     continue
                 forecast_period_end = period_end.strftime('%Y-%m-%d')
                 seen_periods.add(period)
@@ -1277,9 +1288,11 @@ class DataMapper:
                 price_change_val = current_price.get('change') if current_price else None
                 change_pct_val = current_price.get('change_percent') if current_price else None
 
-            # Use published_price for performance calculations (gives up-to-date snapshot)
+            # Use published_price for performance calculations (gives up-to-date snapshot).
+            # Counted in trading sessions: processed_data is calendar-daily, so iloc[-252] was ~8 months back.
+            sessions = trading_rows(processed_data)
             if not processed_data.empty and 'Close' in processed_data.columns:
-                closes = processed_data['Close'].dropna()
+                closes = sessions['Close'].dropna()
 
                 # 15-day change
                 if len(closes) >= 15:
@@ -1318,13 +1331,15 @@ class DataMapper:
                 if 'SP500' in processed_data.columns:
                     sp500_price = float(latest_row['SP500']) if pd.notna(latest_row['SP500']) else None
 
-            # Calculate from_52wk_high_pct & from_52wk_low_pct
-            high_52w = safe_float_conversion(info.get('fiftyTwoWeekHigh'))
+            # Calculate from_52wk_high_pct & from_52wk_low_pct. The vendor range is refreshed about monthly; recent
+            # sessions widen it so a new high is never missing (AAPL stored 348.15 after trading at 351.73).
+            high_52w, low_52w = widened_52w_range(
+                sessions, safe_float_conversion(info.get('fiftyTwoWeekHigh')), safe_float_conversion(info.get('fiftyTwoWeekLow'))
+            )
             from_52wk_high_pct = None
             if published_price and high_52w and high_52w > 0:
                 from_52wk_high_pct = ((published_price - high_52w) / high_52w) * 100
-                
-            low_52w = safe_float_conversion(info.get('fiftyTwoWeekLow'))
+
             from_52wk_low_pct = None
             if published_price and low_52w and low_52w > 0:
                 from_52wk_low_pct = ((published_price - low_52w) / low_52w) * 100
@@ -1420,8 +1435,8 @@ class DataMapper:
                 'overall_pct_change': cap_percentage(overall_pct_change),
 
                 # 52 Week Range
-                'high_52w': float(info.get('fiftyTwoWeekHigh')) if info.get('fiftyTwoWeekHigh') else None,
-                'low_52w': float(info.get('fiftyTwoWeekLow')) if info.get('fiftyTwoWeekLow') else None,
+                'high_52w': high_52w,
+                'low_52w': low_52w,
                 'from_52wk_high_pct': cap_percentage(from_52wk_high_pct),
                 'from_52wk_low_pct': cap_percentage(from_52wk_low_pct),
 

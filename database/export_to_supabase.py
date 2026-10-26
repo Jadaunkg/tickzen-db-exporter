@@ -44,6 +44,7 @@ from database.data_mapper import DataMapper
 from Models.forecast_core import PIPELINE_VERSION as TICKZEN_PROPHET_PIPELINE_VERSION
 from database.supabase_client import SupabaseClient
 from analysis_scripts.risk_analysis import RiskAnalyzer
+from data_processing_scripts.trading_sessions import session_indicator_frame, trading_rows
 from database.financial_contract import (
     SCHEMA_VERSION,
     CALCULATION_VERSION,
@@ -899,9 +900,15 @@ class SupabaseDataExporter:
             latest_indicators_date = self._get_latest_data_date(stock_id, 'technical_indicators', 'date')
             logger.info(f"  📅 Latest technical_indicators date in DB: {latest_indicators_date}")
             
-            # Filter processed_data (has technical indicators) to last 2 years
+            # Indicators recomputed on real trading sessions (the processed frame is calendar-daily: its "200-day"
+            # average spanned ~138 sessions and weekend rows were stored). Falls back to the old frame on error.
+            try:
+                indicator_source = session_indicator_frame(collected_data.get('processed_data'))
+            except Exception as e:
+                logger.warning(f"  ⚠ Session indicators failed, using the processed frame: {e}")
+                indicator_source = collected_data.get('processed_data')
             processed_filtered = self._filter_last_two_years(
-                collected_data.get('processed_data'),
+                indicator_source,
                 'Date'
             )
             
@@ -1091,21 +1098,24 @@ class SupabaseDataExporter:
             
             # Calculate comprehensive risk profile using RiskAnalyzer (with metadata)
             risk_profile = None
+            # Risk is measured over trading sessions only: weekend copies are zero-return "days" that pulled the
+            # 30-day volatility down (AAPL 10.9 % instead of 16.4 %) and distorted VaR / Sharpe.
+            risk_sessions = trading_rows(collected_data['processed_data'])
             try:
-                price_data = collected_data['processed_data']['Close']
-                
+                price_data = risk_sessions['Close']
+
                 # Get market data (S&P 500) if available
                 market_data = None
-                if 'SP500' in collected_data['processed_data'].columns:
-                    market_data = collected_data['processed_data']['SP500']
-                
+                if 'SP500' in risk_sessions.columns:
+                    market_data = risk_sessions['SP500']
+
                 # Calculate comprehensive risk profile (with metadata)
                 risk_profile = self.risk_analyzer.comprehensive_risk_profile_with_metadata(
                     price_data=price_data,
                     market_data=market_data,
                     ticker=ticker,
                     info=collected_data['info'],
-                    processed_data=collected_data['processed_data'],
+                    processed_data=risk_sessions,
                     balance_sheet=collected_data.get('balance_sheet'),
                     financials=collected_data.get('financials')
                 )
@@ -1117,7 +1127,7 @@ class SupabaseDataExporter:
             # Map and export basic risk data (includes CVaR and volatility)
             risk_record = self.mapper.map_risk_data(
                 stock_id,
-                collected_data['processed_data'],
+                risk_sessions,
                 collected_data['info'],
                 risk_profile=risk_profile,
                 market_data=None,  # TODO: Add S&P 500 data if available
