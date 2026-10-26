@@ -39,6 +39,7 @@ data_processing_scripts/data_preprocessing.py
 data_processing_scripts/date_utils.py
 data_processing_scripts/feature_engineering.py
 data_processing_scripts/macro_data.py
+data_processing_scripts/trading_sessions.py
 
 # --- database exporter
 database/azure_postgres_client.py
