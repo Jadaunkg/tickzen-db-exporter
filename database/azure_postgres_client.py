@@ -98,6 +98,18 @@ class AzurePostgresQueryError(Exception):
     """Raised when Azure PostgreSQL query execution fails."""
 
 
+# One connection per thread per database, shared by every client in the process.
+# The web app builds about ten clients (one per service); with a connection each per
+# request thread they held ~29 of the server's 40 slots and locked the updaters out.
+_SHARED_LOCALS: Dict[tuple, threading.local] = {}
+_SHARED_LOCALS_LOCK = threading.Lock()
+
+
+def _shared_thread_local(key: tuple) -> threading.local:
+    with _SHARED_LOCALS_LOCK:
+        return _SHARED_LOCALS.setdefault(key, threading.local())
+
+
 @dataclass
 class AzurePostgresResult:
     """Small result object matching the fields used from Supabase responses."""
@@ -291,7 +303,11 @@ class AzureTableQuery:
             query += sql.SQL(" LIMIT %s")
             params.append(self._limit)
 
-        with self.db.connection.cursor(cursor_factory=RealDictCursor) as cursor:
+        connection = self.db.connection
+        # End the transaction this read opens, or the connection sits "idle in
+        # transaction" until its next use. Leave a caller's open transaction alone.
+        own_transaction = connection.get_transaction_status() == psycopg2.extensions.TRANSACTION_STATUS_IDLE
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(query, params)
             rows = [dict(row) for row in cursor.fetchall()]
 
@@ -301,10 +317,12 @@ class AzureTableQuery:
                 sql.Identifier(self.table),
                 where_clause,
             )
-            with self.db.connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(count_query, params[: len(self._filters)])
                 count = cursor.fetchone()["count"]
 
+        if own_transaction:
+            connection.commit()
         return AzurePostgresResult(data=rows, count=count)
 
     def _execute_insert(self) -> AzurePostgresResult:
@@ -430,7 +448,6 @@ class AzurePostgresClient:
         self.max_retries = max_retries
         self.timeout = timeout
         self.batch_size = batch_size
-        self._local = threading.local()
 
         if not self.connection_url and not all([self.host, self.database, self.user, self.password]):
             raise AzurePostgresConnectionError(
@@ -438,6 +455,9 @@ class AzurePostgresClient:
                 "AZURE_POSTGRES_DB, AZURE_POSTGRES_USER, AZURE_POSTGRES_PASSWORD, "
                 "and optionally AZURE_POSTGRES_PORT/AZURE_POSTGRES_SSLMODE."
             )
+        self._local = _shared_thread_local(
+            (self.connection_url, self.host, self.port, self.database, self.user, self.sslmode)
+        )
 
         self.query_count = 0
         self.error_count = 0

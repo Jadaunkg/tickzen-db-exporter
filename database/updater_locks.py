@@ -8,6 +8,7 @@ Session-level locks on one dedicated connection: they are released automatically
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -20,11 +21,23 @@ WORKER_LOCKS = 728191   # (WORKER_LOCKS, index) - one run per worker; (WORKER_LO
 EARNINGS_LOCK = -1
 
 
+CONNECT_WAITS = (15, 30, 60)   # seconds between tries when the server has no free connection slot
+
+
 class UpdaterLocks:
     def __init__(self, db):
         self.db = db
-        self.conn = db._connect_new()
+        self.conn = self._connect_with_retry()
         self.conn.autocommit = True
+
+    def _connect_with_retry(self):
+        for wait in CONNECT_WAITS:
+            try:
+                return self.db._connect_new()
+            except Exception as e:
+                logger.warning(f"Lock connection failed, retrying in {wait}s: {e}")
+                time.sleep(wait)
+        return self.db._connect_new()
 
     def _call(self, fn: str, namespace: int, key_sql: str, key) -> bool:
         with self.conn.cursor() as cur:
