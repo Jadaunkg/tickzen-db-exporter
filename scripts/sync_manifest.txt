@@ -54,6 +54,7 @@ database/extract_schema.py
 database/financial_contract.py
 database/init_database.py
 database/pipeline_data_collector.py
+database/price_history.py
 database/setup_azure_schema.py
 database/smart_updater.py
 database/stock_registry.py
@@ -75,6 +76,7 @@ database/migrations/20261006_analyst_detail.sql
 database/migrations/20261016_analyst_eps_trend.sql
 database/migrations/20261016_updater_runs.sql
 database/migrations/20261025_implied_move_status.sql
+database/migrations/20261101_market_index_history.sql
 
 # --- schema references
 database/COMPLETE_DATABASE_SCHEMA.sql

@@ -845,14 +845,10 @@ class SupabaseDataExporter:
                 logger.info(f"  ℹ️ No raw price data available, using processed_data")
                 raw_price_data = collected_data.get('processed_data')
             
-            # First filter to last 2 years for database storage policy
-            filtered_price_data = self._filter_last_two_years(
-                raw_price_data, 
-                'Date'
-            )
-            
+            # Full history is kept (no 2-year cut): older years than the download covers are added by
+            # database/price_history.py (one request per stock, marks stocks.price_history_complete_at).
+            filtered_price_data = raw_price_data
             logger.info(f"  📅 Raw data: {len(raw_price_data) if hasattr(raw_price_data, '__len__') else 'N/A'} rows")
-            logger.info(f"  📅 Filtered data: {len(filtered_price_data) if hasattr(filtered_price_data, '__len__') else 'N/A'} rows (last 2 years only)")
             
             # Get latest date in database for this stock
             latest_price_date = self._get_latest_data_date(stock_id, 'daily_price_data', 'date')
@@ -1105,8 +1101,13 @@ class SupabaseDataExporter:
                 price_data = risk_sessions['Close']
 
                 # Get market data (S&P 500) if available
+                # Same-date S&P 500 closes from market_index_daily; FRED's SP500 (forward-filled, days late) only
+                # when that series is not stored yet.
                 market_data = None
-                if 'SP500' in risk_sessions.columns:
+                if hasattr(self.db, 'execute_raw_sql'):
+                    from database.price_history import align_benchmark
+                    market_data = align_benchmark(self.db, risk_sessions)
+                if market_data is None and 'SP500' in risk_sessions.columns:
                     market_data = risk_sessions['SP500']
 
                 # Calculate comprehensive risk profile (with metadata)
@@ -1199,6 +1200,11 @@ class SupabaseDataExporter:
                 collected_data['processed_data']
             )
             self._carry_forward_snapshot_size(stock_id, snapshot_record)
+            # sp500_index is the S&P 500 close of the snapshot's own date (None until stored), never FRED's latest
+            # value copied onto a later day.
+            if hasattr(self.db, 'execute_raw_sql'):
+                from database.price_history import benchmark_close_on
+                snapshot_record['sp500_index'] = benchmark_close_on(self.db, snapshot_record.get('date'))
 
             self.db.client.table('market_price_snapshot').upsert(
                 [snapshot_record],

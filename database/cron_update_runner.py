@@ -251,6 +251,10 @@ def main():
     logger.info("✓ Using AZURE database configuration.")
     run_log = RunLog(db, egress_ip=egress_ip, **log_meta)
 
+    # Same-date S&P 500 for tonight's snapshots: 2 Yahoo requests once per session, skipped when already stored.
+    from database import price_history
+    price_history.refresh_market_index(db, cutoff)
+
     # 3. Load Tickers from the database
     try:
         all_tickers = load_tickers_from_db(db)
@@ -350,6 +354,10 @@ def main():
                 # This worker's part is done: run the earnings step before helping other parts.
                 run_earnings_step(locks)
                 earnings_done = True
+                # Then a few older-years backfills from this part and (worker 0) the nightly price checks.
+                part = assign_parts(all_tickers, worker_count)
+                price_history.nightly_step(db, getattr(exporter, 'mapper', None), [s for s in all_tickers if part[s] == worker_index],
+                                           cutoff, worker_index, stop=lambda: check_stop() is not None)
                 stop_reason = check_stop()
                 if stop_reason:
                     break
@@ -395,6 +403,8 @@ def main():
             logger.error(f"Exception during export of {ticker}: {e}", exc_info=True)
         finally:
             locks.release(ticker)
+        if new_only and status == 'success':   # first load done: add the older years (1 Yahoo request, never raises)
+            price_history.complete_new_stock(db, getattr(exporter, 'mapper', None), ticker)
         stock_requests = pacer.since_mark()
         helped += is_helping
         run_log.stock(ticker, status, stock_started, own_part=not is_helping,
