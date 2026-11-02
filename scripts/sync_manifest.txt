@@ -55,6 +55,7 @@ database/financial_contract.py
 database/init_database.py
 database/pipeline_data_collector.py
 database/price_history.py
+database/history_sync.py
 database/setup_azure_schema.py
 database/smart_updater.py
 database/stock_registry.py

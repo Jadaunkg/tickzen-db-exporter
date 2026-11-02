@@ -45,6 +45,7 @@ from Models.forecast_core import PIPELINE_VERSION as TICKZEN_PROPHET_PIPELINE_VE
 from database.supabase_client import SupabaseClient
 from analysis_scripts.risk_analysis import RiskAnalyzer
 from data_processing_scripts.trading_sessions import market_date, session_indicator_frame, trading_rows
+from database.history_sync import is_new, plan_indicator_rows, plan_price_rows
 from database.financial_contract import (
     SCHEMA_VERSION,
     CALCULATION_VERSION,
@@ -854,21 +855,35 @@ class SupabaseDataExporter:
             latest_price_date = self._get_latest_data_date(stock_id, 'daily_price_data', 'date')
             logger.info(f"  📅 Latest daily_price_data date in DB: {latest_price_date}")
             
-            # Filter to only new records (newer than latest DB date)
-            incremental_price_data = self._filter_new_records_only(
-                filtered_price_data, 
-                latest_price_date, 
-                'Date',
-                overlap_days=7,
-            )
-            
-            if incremental_price_data is not None and len(incremental_price_data) > 0:
-                logger.info(f"  📅 Found {len(incremental_price_data)} new trading days to export")
-                price_records = self.mapper.map_daily_prices(
-                    stock_id,
-                    incremental_price_data
+            # Rows to write: every downloaded day that is new or differs from the stored row (Yahoo's adjusted
+            # series rewrites the past after splits and dividends), see database/history_sync.py. Falls back to
+            # the newest rows only (7-day overlap) when there is no SQL access or the download is not trusted.
+            price_records = None
+            run_sql = getattr(self.db.client, 'execute_raw_sql', None)
+            if callable(run_sql) and latest_price_date is not None and filtered_price_data is not None and len(filtered_price_data) > 1:
+                try:
+                    price_records, why = plan_price_rows(run_sql, self.mapper, stock_id, filtered_price_data)
+                except Exception as e:  # noqa: BLE001 - history repair must never block the daily rows
+                    price_records, why = None, str(e)
+                if price_records is None:
+                    logger.warning(f"  ⚠ Price history not rewritten ({why}); writing the newest rows only")
+                else:
+                    fresh = sum(1 for r in price_records if is_new(r, latest_price_date))
+                    logger.info(f"  📅 {fresh} new trading days, {len(price_records) - fresh} stored days corrected")
+            if price_records is None:
+                # Filter to only new records (newer than latest DB date)
+                incremental_price_data = self._filter_new_records_only(
+                    filtered_price_data,
+                    latest_price_date,
+                    'Date',
+                    overlap_days=7,
                 )
-                
+                if incremental_price_data is not None and len(incremental_price_data) > 0:
+                    logger.info(f"  📅 Found {len(incremental_price_data)} new trading days to export")
+                    price_records = self.mapper.map_daily_prices(stock_id, incremental_price_data)
+
+            if price_records:
+
                 # Batch insert only new price records
                 batch_size = 1000
                 total_inserted = 0
@@ -898,31 +913,47 @@ class SupabaseDataExporter:
             
             # Indicators recomputed on real trading sessions (the processed frame is calendar-daily: its "200-day"
             # average spanned ~138 sessions and weekend rows were stored). Falls back to the old frame on error.
+            sessions_ok = True
             try:
                 indicator_source = session_indicator_frame(collected_data.get('processed_data'))
             except Exception as e:
                 logger.warning(f"  ⚠ Session indicators failed, using the processed frame: {e}")
                 indicator_source = collected_data.get('processed_data')
+                sessions_ok = False
             processed_filtered = self._filter_last_two_years(
                 indicator_source,
                 'Date'
             )
-            
-            # Filter to only new records (newer than latest DB date)
-            # MUST use processed_data which has technical indicator columns (SMA, RSI, MACD, etc.)
-            incremental_indicators_data = self._filter_new_records_only(
-                processed_filtered,
-                latest_indicators_date, 
-                'Date',
-                overlap_days=7,
-            )
-            
-            if incremental_indicators_data is not None and len(incremental_indicators_data) > 0:
-                tech_records = self.mapper.map_technical_indicators(
-                    stock_id,
-                    incremental_indicators_data
+
+            # Same rule as the prices: rewrite every day of the 2-year window whose stored values differ (rows from
+            # before the trading-session fix, or after a split / dividend re-adjusted the prices). Never from the
+            # calendar-day fallback frame: that would put the wrong values back.
+            tech_records = None
+            run_sql = getattr(self.db.client, 'execute_raw_sql', None)
+            if sessions_ok and callable(run_sql) and latest_indicators_date is not None and processed_filtered is not None and len(processed_filtered) > 0:
+                try:
+                    tech_records, why = plan_indicator_rows(run_sql, self.mapper, stock_id, processed_filtered)
+                except Exception as e:  # noqa: BLE001 - history repair must never block the daily rows
+                    tech_records, why = None, str(e)
+                if tech_records is None:
+                    logger.warning(f"  ⚠ Indicator history not rewritten ({why}); writing the newest rows only")
+                else:
+                    fresh = sum(1 for r in tech_records if is_new(r, latest_indicators_date))
+                    logger.info(f"  📅 {fresh} new indicator days, {len(tech_records) - fresh} stored days corrected")
+            if tech_records is None:
+                # Filter to only new records (newer than latest DB date)
+                # MUST use processed_data which has technical indicator columns (SMA, RSI, MACD, etc.)
+                incremental_indicators_data = self._filter_new_records_only(
+                    processed_filtered,
+                    latest_indicators_date,
+                    'Date',
+                    overlap_days=7,
                 )
-                
+                if incremental_indicators_data is not None and len(incremental_indicators_data) > 0:
+                    tech_records = self.mapper.map_technical_indicators(stock_id, incremental_indicators_data)
+
+            if tech_records:
+
                 # Batch insert only new indicator records
                 batch_size = 1000
                 total_inserted = 0
