@@ -154,3 +154,104 @@ def plan_indicator_rows(run_sql, mapper, stock_id: int, session_frame) -> Tuple[
 def is_new(record: Dict[str, Any], latest_stored: Any) -> bool:
     """Dated after the newest stored row (for the log: new rows vs corrected history)."""
     return latest_stored is None or _day(record.get('date')) > _day(latest_stored)
+
+
+# ---------------------------------------------------------------- indicators from the stored prices
+#
+# The export used to compute indicators on its 2-year download after two warm-up cuts: the calendar-day pipeline
+# dropped its first ~200 days, then the session recompute dropped its first ~200 sessions. Only the newest ~8
+# months were ever rewritten (rows before ~2026-03-09 kept the old calendar-day values), and a short history got
+# shrunken windows (ALH: a "50-day" average of 43 sessions). Indicators are now computed from daily_price_data,
+# which the price step has just made equal to the adjusted download, with ~600 extra days of warm-up, over the
+# whole stored window. One rule for every stock; the backfill script uses the same function.
+
+INDICATOR_WINDOW_DAYS = 730
+WARMUP_DAYS = 600
+SESSION_SQL = ('SELECT date, open_price, high_price, low_price, close_price, volume FROM daily_price_data '
+               'WHERE stock_id = %s AND date >= %s ORDER BY date')
+STORED_INDICATOR_SQL = 'SELECT * FROM technical_indicators WHERE stock_id = %s'
+DELETE_INDICATOR_SQL = 'DELETE FROM technical_indicators WHERE stock_id = %s AND date = ANY(%s::date[])'
+
+
+def sessions_frame(rows: Iterable[Dict[str, Any]]):
+    """daily_price_data rows -> Date/Open/High/Low/Close/Volume frame (oldest first)."""
+    import pandas as pd
+
+    frame = pd.DataFrame([{
+        'Date': pd.Timestamp(_day(r['date'])),
+        'Open': _num(r.get('open_price')), 'High': _num(r.get('high_price')),
+        'Low': _num(r.get('low_price')), 'Close': _num(r.get('close_price')),
+        'Volume': _num(r.get('volume')),
+    } for r in rows])
+    if frame.empty:
+        return frame
+    return frame.dropna(subset=['Close']).sort_values('Date').reset_index(drop=True)
+
+
+def plan_indicator_rewrite(run_sql, mapper, stock_id: int, today: Optional[date] = None
+                           ) -> Tuple[Optional[List[Dict[str, Any]]], List[str], str]:
+    """
+    (rows to upsert, dates to delete, reason) so technical_indicators equals the indicators of the stored sessions
+    over the last INDICATOR_WINDOW_DAYS (and any older stored indicator day). Upserts are only the rows that are new
+    or differ beyond rounding; deletes are stored indicator days with no stored session (holidays, weekend rows).
+    (None, [], reason) when there are no stored prices to compute from.
+    """
+    from datetime import timedelta
+    from data_processing_scripts.trading_sessions import stored_indicator_frame
+
+    today = today or date.today()
+    stored = run_sql(STORED_INDICATOR_SQL, [stock_id]) or []
+    keep_from = _day(today - timedelta(days=INDICATOR_WINDOW_DAYS))
+    if stored:
+        keep_from = min(keep_from, min(_day(r['date']) for r in stored))
+    read_from = _day(datetime.strptime(keep_from, '%Y-%m-%d').date() - timedelta(days=WARMUP_DAYS))
+    price_rows = run_sql(SESSION_SQL, [stock_id, read_from]) or []
+    sessions = sessions_frame(price_rows)
+    if sessions.empty:
+        return None, [], 'no stored prices'
+    frame = stored_indicator_frame(sessions)
+    records = rows_from(mapper.map_technical_indicators(stock_id, frame), keep_from)
+    session_days = {_day(d) for d in sessions['Date']}
+    first_session = min(session_days)
+    deletes = sorted(_day(r['date']) for r in stored
+                     if _day(r['date']) >= first_session and _day(r['date']) not in session_days)
+    return changed_records(records, stored), deletes, 'ok'
+
+
+# ---------------------------------------------------------------- stored rows older than the download
+
+# The oldest downloaded day is compared with its stored row: when they disagree the rows before the download were
+# adjusted for an older split/dividend state (KLAC kept $654 on 2024-11-04 while the next day is $66). The export
+# then marks the stock for the nightly full-history job (database/price_history.py), which rewrites them.
+STALE_HISTORY_REL_TOL = 0.002
+
+
+def history_before_download_is_stale(price_records: Sequence[Dict[str, Any]],
+                                     stored_rows: Iterable[Dict[str, Any]]) -> Tuple[bool, str]:
+    """(stale, reason) from the oldest downloaded record and the stored row on the same day."""
+    if not price_records:
+        return False, 'no download'
+    first = price_records[0]
+    stored = {_day(r.get('date')): r for r in stored_rows}
+    old = stored.get(_day(first.get('date')))
+    if old is None:
+        return False, 'oldest downloaded day not stored'
+    a, b = _num(first.get('close_price')), _num(old.get('close_price'))
+    if a is None or b is None or a <= 0 or b <= 0:
+        return False, 'no close to compare'
+    if abs(a / b - 1) > STALE_HISTORY_REL_TOL:
+        return True, f"{_day(first.get('date'))}: stored close {b:.4f} vs download {a:.4f}"
+    return False, 'ok'
+
+
+def check_history_before_download(run_sql, mapper, stock_id: int, price_frame) -> Tuple[bool, str]:
+    """history_before_download_is_stale for the export: maps the download, reads the stored oldest day."""
+    records = mapper.map_daily_prices(stock_id, price_frame)
+    if not records:
+        return False, 'no download'
+    day = _day(records[0]['date'])
+    stored = run_sql(PRICE_SQL + ' AND date <= %s', [stock_id, day, day]) or []
+    return history_before_download_is_stale(records[:1], stored)
+
+
+MARK_HISTORY_INCOMPLETE_SQL = 'UPDATE stocks SET price_history_complete_at = NULL WHERE id = %s'

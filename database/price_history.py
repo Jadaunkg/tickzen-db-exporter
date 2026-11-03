@@ -145,11 +145,19 @@ def pending_backfill(db, symbols: Iterable[str], limit: int) -> List[Dict]:
         "GROUP BY s.id, s.symbol, s.created_at ORDER BY s.created_at, s.symbol LIMIT %s", [symbols, limit])
 
 
-def backfill_price_history(db, mapper, stock_id: int, symbol: str, first_date=None,
-                           start: str = PRICE_HISTORY_START) -> Optional[int]:
-    """Load the sessions before the stock's first stored date (one Yahoo request) and mark the history complete.
+# The daily download covers ~730 days; rows older than this are rewritten here (a few days of overlap).
+REWRITE_UPTO_DAYS = 720
 
-    The first stored session is rewritten too, so its daily change is computed from the new previous close.
+
+def backfill_price_history(db, mapper, stock_id: int, symbol: str, first_date=None,
+                           start: str = PRICE_HISTORY_START, today: Optional[date] = None) -> Optional[int]:
+    """Load the sessions before the daily download window (one Yahoo request) and mark the history complete.
+
+    Covers the years before the stock's first stored date and rewrites the stored sessions older than the daily
+    2-year download (up to REWRITE_UPTO_DAYS ago): the export only rewrites days it downloads, so older rows kept an
+    old split/dividend adjustment (KLAC $654 on 2024-11-04 next to $66 the day after). The export clears
+    price_history_complete_at when it sees that (database/history_sync.py), so this runs again for that stock.
+    Prices are split- and dividend-adjusted like the daily download (auto_adjust=True), so the two series join.
     Returns rows written, or None when nothing was marked (Yahoo error: try again another night)."""
     if first_date is None:
         rows = db.execute_raw_sql("SELECT min(date) AS d FROM daily_price_data WHERE stock_id = %s", [stock_id])
@@ -157,15 +165,16 @@ def backfill_price_history(db, mapper, stock_id: int, symbol: str, first_date=No
     if first_date is None:
         return None
     first = pd.Timestamp(first_date)
+    upto = max(first, pd.Timestamp(today or date.today()) - pd.Timedelta(days=REWRITE_UPTO_DAYS))
     written = 0
-    if first > pd.Timestamp(start) + pd.Timedelta(days=7):
+    if first > pd.Timestamp(start) + pd.Timedelta(days=7) or upto > first:
         try:
-            bars = _bars(_yf().Ticker(symbol).history(start=start, end=(first + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-                                                      auto_adjust=False, actions=False))
+            bars = _bars(_yf().Ticker(symbol).history(start=start, end=(upto + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                                                      auto_adjust=True, actions=False))
         except Exception as e:
             logger.warning(f"{symbol}: history backfill failed, retry next night: {e}")
             return None
-        bars = bars[bars["Date"] <= first]
+        bars = bars[bars["Date"] <= upto]
         if len(bars) > 1:
             records = mapper.map_daily_prices(stock_id, bars)
             for i in range(0, len(records), 1000):

@@ -45,7 +45,10 @@ from Models.forecast_core import PIPELINE_VERSION as TICKZEN_PROPHET_PIPELINE_VE
 from database.supabase_client import SupabaseClient
 from analysis_scripts.risk_analysis import RiskAnalyzer
 from data_processing_scripts.trading_sessions import market_date, session_indicator_frame, trading_rows
-from database.history_sync import is_new, plan_indicator_rows, plan_price_rows
+from database.history_sync import (
+    DELETE_INDICATOR_SQL, MARK_HISTORY_INCOMPLETE_SQL, check_history_before_download, is_new,
+    plan_indicator_rewrite, plan_indicator_rows, plan_price_rows,
+)
 from database.financial_contract import (
     SCHEMA_VERSION,
     CALCULATION_VERSION,
@@ -870,6 +873,16 @@ class SupabaseDataExporter:
                 else:
                     fresh = sum(1 for r in price_records if is_new(r, latest_price_date))
                     logger.info(f"  📅 {fresh} new trading days, {len(price_records) - fresh} stored days corrected")
+                # Rows older than the download are never rewritten here: when the oldest downloaded day disagrees
+                # with its stored row they carry an old adjustment, so the nightly full-history job redoes them.
+                try:
+                    stale, stale_why = check_history_before_download(run_sql, self.mapper, stock_id, filtered_price_data)
+                    if stale:
+                        run_sql(MARK_HISTORY_INCOMPLETE_SQL, [stock_id])
+                        logger.warning(f"  ⚠ Stored prices before the download are stale ({stale_why}); "
+                                       f"queued for the full-history rewrite")
+                except Exception as e:  # noqa: BLE001 - a check, never blocks the daily rows
+                    logger.warning(f"  ⚠ Older-history check failed: {e}")
             if price_records is None:
                 # Filter to only new records (newer than latest DB date)
                 incremental_price_data = self._filter_new_records_only(
@@ -930,7 +943,25 @@ class SupabaseDataExporter:
             # calendar-day fallback frame: that would put the wrong values back.
             tech_records = None
             run_sql = getattr(self.db.client, 'execute_raw_sql', None)
-            if sessions_ok and callable(run_sql) and latest_indicators_date is not None and processed_filtered is not None and len(processed_filtered) > 0:
+            # First choice: recompute from the stored prices just written (whole stored window, full warm-up, same
+            # add_technical_indicators), upsert only the rows that differ and delete days with no session.
+            if callable(run_sql):
+                try:
+                    tech_records, stray_days, why = plan_indicator_rewrite(run_sql, self.mapper, stock_id)
+                except Exception as e:  # noqa: BLE001 - fall back to the download-based rows below
+                    tech_records, stray_days, why = None, [], str(e)
+                if tech_records is None:
+                    logger.warning(f"  ⚠ Indicators from stored prices failed ({why}); using the download")
+                else:
+                    fresh = sum(1 for r in tech_records if is_new(r, latest_indicators_date))
+                    logger.info(f"  📅 {fresh} new indicator days, {len(tech_records) - fresh} stored days corrected"
+                                f" (from stored prices), {len(stray_days)} days without a session removed")
+                    if stray_days:
+                        try:
+                            run_sql(DELETE_INDICATOR_SQL, [stock_id, stray_days])
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning(f"  ⚠ Could not remove indicator days without a session: {e}")
+            if tech_records is None and sessions_ok and callable(run_sql) and latest_indicators_date is not None and processed_filtered is not None and len(processed_filtered) > 0:
                 try:
                     tech_records, why = plan_indicator_rows(run_sql, self.mapper, stock_id, processed_filtered)
                 except Exception as e:  # noqa: BLE001 - history repair must never block the daily rows

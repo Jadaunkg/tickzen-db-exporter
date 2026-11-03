@@ -178,8 +178,14 @@ try:
 except ImportError:
     _USE_WILDER_RSI = False
 
-def add_technical_indicators(data):
-    """Create technical indicators with strict feature control"""
+def add_technical_indicators(data, standard_windows=False):
+    """
+    Create technical indicators with strict feature control.
+
+    standard_windows=True is for stored indicators (technical_indicators table, stock pages): every window is the
+    standard one (a "200-day" average is always 200 sessions and stays empty until 200 sessions exist) and no row
+    is dropped or back-filled. The default keeps the adaptive windows and NaN handling the models were trained with.
+    """
     if 'Date' not in data.columns:
         raise ValueError("Missing Date column in feature engineering input data")
     
@@ -188,8 +194,8 @@ def add_technical_indicators(data):
     # Check data size and warn if insufficient for full technical analysis
     DATA_SIZE = len(df)
     MIN_ROWS_FOR_FULL_TA = 200  # Need 200+ rows for standard technical indicators
-    IS_SMALL_DATASET = DATA_SIZE < MIN_ROWS_FOR_FULL_TA
-    
+    IS_SMALL_DATASET = DATA_SIZE < MIN_ROWS_FOR_FULL_TA and not standard_windows
+
     if IS_SMALL_DATASET:
         import logging
         logger = logging.getLogger(__name__)
@@ -268,10 +274,14 @@ def add_technical_indicators(data):
         
         # Moving Averages - Simple (SMA) with adaptive windows for small datasets
         df['MA_7'] = df['Close'].rolling(window=7, min_periods=1).mean()
-        df['MA_20'] = SMAIndicator(close=df['Close'], window=min(20, DATA_SIZE // 2), fillna=False).sma_indicator()
-        df['MA_50'] = SMAIndicator(close=df['Close'], window=min(50, max(20, DATA_SIZE // 3)), fillna=False).sma_indicator()
-        df['MA_100'] = SMAIndicator(close=df['Close'], window=min(100, max(30, DATA_SIZE // 2)), fillna=False).sma_indicator()
-        df['MA_200'] = SMAIndicator(close=df['Close'], window=min(200, max(50, int(DATA_SIZE * 0.75))), fillna=False).sma_indicator()
+        if standard_windows:
+            for ma_col, ma_window in (('MA_20', 20), ('MA_50', 50), ('MA_100', 100), ('MA_200', 200)):
+                df[ma_col] = df['Close'].rolling(window=ma_window, min_periods=ma_window).mean()
+        else:
+            df['MA_20'] = SMAIndicator(close=df['Close'], window=min(20, DATA_SIZE // 2), fillna=False).sma_indicator()
+            df['MA_50'] = SMAIndicator(close=df['Close'], window=min(50, max(20, DATA_SIZE // 3)), fillna=False).sma_indicator()
+            df['MA_100'] = SMAIndicator(close=df['Close'], window=min(100, max(30, DATA_SIZE // 2)), fillna=False).sma_indicator()
+            df['MA_200'] = SMAIndicator(close=df['Close'], window=min(200, max(50, int(DATA_SIZE * 0.75))), fillna=False).sma_indicator()
         
         # Moving Averages - Exponential (EMA)
         df['EMA_12'] = EMAIndicator(close=df['Close'], window=12, fillna=False).ema_indicator()
@@ -325,7 +335,7 @@ def add_technical_indicators(data):
         df['Green_Days_Count'] = df.index.map(calculate_green_days)
         
         # Support & Resistance (adaptive window for small datasets)
-        support_resistance_window = min(30, max(7, DATA_SIZE // 3))
+        support_resistance_window = 30 if standard_windows else min(30, max(7, DATA_SIZE // 3))
         df['Support_30D'] = df['Low'].rolling(window=support_resistance_window, min_periods=1).min()
         df['Resistance_30D'] = df['High'].rolling(window=support_resistance_window, min_periods=1).max()
         
@@ -354,6 +364,10 @@ def add_technical_indicators(data):
     if missing_ta_features:
         raise ValueError(f"Failed to create all expected technical indicators: {missing_ta_features}")
     
+    if standard_windows:
+        # Warm-up rows keep empty values (stored as NULL); the caller decides which dates to keep.
+        return df
+
     # Handle NaN values intelligently based on dataset size
     if IS_SMALL_DATASET:
         # For small datasets, fill NaNs forward then backward to preserve all data

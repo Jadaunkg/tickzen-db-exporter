@@ -66,10 +66,32 @@ def session_indicator_frame(processed: Optional[pd.DataFrame]) -> Optional[pd.Da
         return sessions
     # The indicator step reads the prices and the S&P 500 level (Market_Cap_Relative); everything else it adds.
     inputs = ['Date'] + OHLCV + [c for c in ('SP500',) if c in sessions.columns]
-    recomputed = add_technical_indicators(sessions[inputs].copy())
+    recomputed = add_technical_indicators(sessions[inputs].copy(), standard_windows=True)
     indicator_cols = [c for c in recomputed.columns if c not in inputs]
     kept = sessions.drop(columns=[c for c in indicator_cols if c in sessions.columns])
     return kept.merge(recomputed[['Date'] + indicator_cols], on='Date', how='inner')
+
+
+def stored_indicator_frame(sessions: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """
+    Indicators for the technical_indicators table from stored trading sessions (daily_price_data rows: Date and
+    OHLCV, oldest first, one row per session). Same add_technical_indicators as everywhere else, with the standard
+    windows: the warm-up uses every session given, so a stock with 268 sessions gets a true 200-session average from
+    its 200th session on (ALH) and an empty one before. Market_Cap_Relative is not stored, so the S&P level is a
+    placeholder. Returns Date plus the indicator columns, one row per session.
+    """
+    from data_processing_scripts.feature_engineering import add_technical_indicators
+
+    if sessions is None or sessions.empty:
+        return sessions
+    frame = sessions[['Date'] + OHLCV].copy()
+    frame['Date'] = pd.to_datetime(frame['Date'])
+    for col in OHLCV:
+        frame[col] = pd.to_numeric(frame[col], errors='coerce').astype(float)
+    frame = frame.dropna(subset=['Close']).sort_values('Date').drop_duplicates('Date', keep='last')
+    frame['Volume'] = frame['Volume'].fillna(0.0)
+    frame['SP500'] = 1.0
+    return add_technical_indicators(frame.reset_index(drop=True), standard_windows=True)
 
 
 def range_52w(sessions: Optional[pd.DataFrame], vendor_high, vendor_low):

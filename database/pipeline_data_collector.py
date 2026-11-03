@@ -38,7 +38,10 @@ import yfinance as yf
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import data collection functions
-from data_processing_scripts.data_collection import NEWS_COUNT, fetch_real_time_data, fetch_ticker_news, _yf_ticker
+from data_processing_scripts.data_collection import (
+    NEWS_COUNT, fetch_real_time_data, fetch_ticker_news, _yf_ticker, get_last_expected_trading_day,
+    get_last_fetch_error,
+)
 from data_processing_scripts.macro_data import fetch_macro_indicators
 from data_processing_scripts.data_preprocessing import preprocess_data
 from Models import forecast_core
@@ -119,6 +122,23 @@ def as_utc_date(value) -> Optional[date]:
 def _cache_file_date(stamp: str) -> date:
     """Date from a cache file stamp: ``YYYY-MM-DD``, or legacy ``YYYY-MM`` (first of the month)."""
     return date.fromisoformat(stamp if len(stamp) == 10 else f'{stamp}-01')
+
+
+def stale_price_download(stock_data, fetch_error, last_expected_day) -> Optional[str]:
+    """
+    A reason when the price frame is an old cached copy served after a failed or throttled Yahoo fetch: the fetch
+    recorded an error and the newest bar is older than the last session that should have closed. A stock that
+    simply has no new bar (halted, holiday) has no fetch error and is not flagged.
+    """
+    if not fetch_error or stock_data is None or getattr(stock_data, 'empty', True) or 'Date' not in stock_data.columns:
+        return None
+    newest = pd.to_datetime(stock_data['Date'], errors='coerce').max()
+    if pd.isna(newest) or last_expected_day is None:
+        return None
+    if newest.date() < last_expected_day:
+        return (f"stale cached prices: newest bar {newest.date()}, expected {last_expected_day} "
+                f"(Yahoo fetch {fetch_error.get('type', 'error')})")
+    return None
 
 
 class PipelineDataCollector:
@@ -702,6 +722,14 @@ class PipelineDataCollector:
                 if result['stock_data'] is None or result['stock_data'].empty:
                     raise ValueError(f"No historical data found for {ticker}")
                 
+                stale_why = stale_price_download(result['stock_data'], get_last_fetch_error(ticker),
+                                                 get_last_expected_trading_day())
+                if stale_why:
+                    # Yahoo failed or was rate-limited and an old cached file was returned (AZO, Nov 2: 21 of the
+                    # 01:00 UTC batch kept Oct 30 and were marked "success"). Failing the collection blocks publication and the
+                    # stock is retried by the next batch instead of waiting a day.
+                    raise ValueError(stale_why)
+
                 logger.info(f"  ✓ Collected {len(result['stock_data'])} days of price data")
                 logger.info(f"  ✓ Current price: ${result['current_price']['current_price']}")
                 
