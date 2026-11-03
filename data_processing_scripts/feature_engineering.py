@@ -372,7 +372,7 @@ def add_technical_indicators(data, standard_windows=False):
     if IS_SMALL_DATASET:
         # For small datasets, fill NaNs forward then backward to preserve all data
         # This is more important than perfect technical indicator calculations
-        df_cleaned = df.fillna(method='ffill').fillna(method='bfill')
+        df_cleaned = df.ffill().bfill()
         if df_cleaned.empty:
             # Fallback: still have no data after forward/backward fill - likely all NaN row
             df_cleaned = df.fillna(0)
