@@ -162,6 +162,12 @@ def is_rate_limited(errors) -> bool:
     return any(marker in str(err).lower() for err in (errors or []) for marker in RATE_LIMIT_MARKERS)
 
 
+def own_part(tickers: list, worker_index: int, worker_count: int) -> list:
+    """The symbols this worker owns (same split as build_queue)."""
+    part = assign_parts(tickers, worker_count)
+    return [s for s in tickers if part[s] == worker_index]
+
+
 def run_earnings_step(locks) -> None:
     """Recent-reporter history refresh. Freshness-gated, never fatal, one worker at a time. (Implied moves need live
     option quotes, so they run in the market-hours job database/implied_moves_job.py, not here.)"""
@@ -299,12 +305,32 @@ def main():
         logger.info("Preview mode active. Exiting without execution.")
         sys.exit(0)
 
+    from database.updater_locks import UpdaterLocks
+
     if not own and not (help_others and others):
-        logger.info("✓ All stocks are up to date since the last close. No execution needed.")
-        run_log.seen("all stocks current")
+        logger.info("✓ All stocks are up to date since the last close. No export needed.")
+        outcome = "all stocks current"
+        if not new_only:
+            # The nightly price step still runs: the last session's final bars only exist after FINAL_BAR_AFTER_ET,
+            # when every stock is long current (history backfills and price checks continue on a quiet night too).
+            try:
+                locks = UpdaterLocks(db)
+            except Exception as e:
+                locks = None
+                logger.warning(f"Nightly price step skipped (no lock connection): {e}")
+            if locks is not None and locks.worker(worker_index):
+                quiet_deadline = time.monotonic() + args.max_minutes * 60 if args.max_minutes > 0 else None
+                price_history.nightly_step(
+                    db, getattr(exporter, 'mapper', None), own_part(all_tickers, worker_index, worker_count), cutoff,
+                    worker_index, stop=lambda: (not window_open() or pacer.throttled >= stop_after_429 > 0
+                                                or (quiet_deadline is not None and time.monotonic() >= quiet_deadline)))
+                if pacer.total:
+                    outcome += f"; nightly price step: {pacer.total} Yahoo requests, {pacer.throttled} 429s"
+            if locks is not None:
+                locks.close()
+        run_log.seen(outcome)
         sys.exit(0)
 
-    from database.updater_locks import UpdaterLocks
     locks = UpdaterLocks(db)
     lock_index = NEW_STOCKS_LOCK_INDEX if new_only else worker_index
     if not locks.worker(lock_index):
@@ -354,9 +380,9 @@ def main():
                 # This worker's part is done: run the earnings step before helping other parts.
                 run_earnings_step(locks)
                 earnings_done = True
-                # Then a few older-years backfills from this part and (worker 0) the nightly price checks.
-                part = assign_parts(all_tickers, worker_count)
-                price_history.nightly_step(db, getattr(exporter, 'mapper', None), [s for s in all_tickers if part[s] == worker_index],
+                # Then the nightly price step for this part (final bars, history backfills, worker 0's price checks).
+                price_history.nightly_step(db, getattr(exporter, 'mapper', None),
+                                           own_part(all_tickers, worker_index, worker_count),
                                            cutoff, worker_index, stop=lambda: check_stop() is not None)
                 stop_reason = check_stop()
                 if stop_reason:

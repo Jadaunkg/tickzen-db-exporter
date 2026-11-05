@@ -196,3 +196,33 @@ def test_new_stock_loader_exits_quietly_when_nothing_is_new(run):
 def test_nightly_worker_still_waits_for_the_close(run):
     world = run(World(market_open=True))
     assert world.exported == [] and world.finished is None
+
+
+@pytest.fixture
+def nightly(monkeypatch):
+    from database import price_history
+    calls = []
+    monkeypatch.setattr(price_history, "nightly_step",
+                        lambda db, mapper, symbols, cutoff, index=0, stop=None: calls.append((list(symbols), index, stop())))
+    return calls
+
+
+def test_quiet_night_still_runs_the_nightly_price_step(run, nightly):
+    # Every stock current (the 02:00 New York final-bar check happens when all stocks are long synced).
+    world = World()
+    world.current = set(SYMBOLS)
+    run(world)
+    parts = runner.assign_parts(SYMBOLS, 2)
+    assert nightly == [([s for s in SYMBOLS if parts[s] == 0], 0, False)]
+    assert world.lock_indexes == [0] and world.exported == [] and world.finished is None
+
+
+def test_nightly_price_step_runs_once_after_the_own_part(run, nightly):
+    run(World())
+    parts = runner.assign_parts(SYMBOLS, 2)
+    assert [(syms, index) for syms, index, _ in nightly] == [([s for s in SYMBOLS if parts[s] == 0], 0)]
+
+
+def test_new_stock_loader_never_runs_the_nightly_price_step(run, nightly):
+    run(World(new_symbols=[]), env=NEW_ENV)
+    assert nightly == []
